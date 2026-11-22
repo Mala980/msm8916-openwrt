@@ -243,7 +243,7 @@ luci-proto-ppp - 26.180.75667~128a781
 luci-proto-sstp - 26.180.75667~128a781
 luci-proto-wireguard - 26.180.75667~128a781
 luci-theme-bootstrap - 26.180.75667~128a781
-luci-theme-proton2025 - 1.4.4-r4
+luci-theme-proton2025 - 1.4.4-r5
 mkf2fs - 1.16.0-r4
 modemmanager - 1.24.0-r8
 mount-utils - 2.41.5-r1
