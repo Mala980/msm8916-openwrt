@@ -15,6 +15,43 @@
 	5. Row 4: Advanced RF Diagnostics (Waveform Canvas & Neighboring Towers)
 */
 
+// Common Indonesian PLMN codes -> operator brand. Unknown codes show as-is.
+var PLMN_NAMES = {
+	'51001': 'Indosat', '51021': 'Indosat', '51089': 'Tri (Indosat)',
+	'51010': 'Telkomsel',
+	'51011': 'XL', '51008': 'Axis (XL)',
+	'51009': 'Smartfren', '51028': 'Smartfren'
+};
+
+function plmnName(code) {
+	return PLMN_NAMES[code] || code || '--';
+}
+
+function plmnLabel(code) {
+	return PLMN_NAMES[code] ? PLMN_NAMES[code] + ' (' + code + ')' : (code || '--');
+}
+
+// One plain sentence on why there is no service.
+function noServiceReason(op, reg, simPlmn) {
+	if (op.state === 'absent')
+		return _('ModemManager does not report a modem.');
+
+	var sim = simPlmn ? _('Your %s SIM').format(plmnLabel(simPlmn)) : _('The SIM');
+	var foreign = reg.plmn && simPlmn && reg.plmn !== simPlmn;
+
+	if (reg.plmn && foreign && (reg.forbidden || reg.status === 'limited'))
+		return _('%s was not accepted. The modem is camped on a cell of %s, which this SIM is not allowed to use, and no %s cell is usable at this location. Only emergency service is available.')
+			.format(sim, plmnLabel(reg.plmn), plmnName(simPlmn));
+
+	if (reg.plmn && (reg.state === 'registration-denied' || reg.forbidden))
+		return _('%s rejected the registration of this SIM. Only emergency service is available.').format(plmnLabel(reg.plmn));
+
+	if (reg.status === 'limited')
+		return _('The modem is on a cell with emergency-only service.');
+
+	return _('The modem is searching and has not found a network it can use.');
+}
+
 var callGetSignal = rpc.declare({
 	object: 'luci.proton-system',
 	method: 'getSignalDetails',
@@ -223,36 +260,49 @@ return view.extend({
 		if (elEarfcn) elEarfcn.textContent = s.earfcn || '--';
 
 		var reg = data.registration || {};
+		var simPlmn = (hw.imsi && /^[0-9]{5,}$/.test(hw.imsi)) ? hw.imsi.substr(0, 5) : '';
+		var noSvc = !op.registered;
+
 		var elOp = document.getElementById('rf-operator');
 		if (elOp) {
 			if (op.registered)
-				elOp.textContent = (op.name || '--') + (op.code ? ' (' + op.code + ')' : '') + (op.reg_state === 'roaming' ? ' · ' + _('roaming') : '');
+				elOp.textContent = (op.name || plmnName(op.code)) + (op.code ? ' (' + op.code + ')' : '') + (op.reg_state === 'roaming' ? ' · ' + _('roaming') : '');
 			else
-				elOp.textContent = _('Not registered') + (reg.plmn ? ' · ' + _('camped on') + ' ' + reg.plmn : '');
+				elOp.textContent = _('Not registered') + (reg.plmn ? ' · ' + _('camped on') + ' ' + plmnLabel(reg.plmn) : '');
 		}
 
 		// Registration banner: the readings on this page are radio measurements
 		// and exist even with no service, so say plainly when there is none.
 		var elReg = document.getElementById('rf-reg-banner');
 		if (elReg) {
-			if (op.registered) {
+			if (!noSvc) {
 				elReg.style.display = 'none';
 			} else {
-				var why = [];
-				if (reg.state) why.push(_('registration') + ': ' + reg.state);
-				else if (op.reg_state) why.push(_('registration') + ': ' + op.reg_state);
-				if (reg.plmn) why.push(_('camped on PLMN') + ' ' + reg.plmn);
-				if (reg.status) why.push(_('service') + ': ' + reg.status);
-				if (reg.forbidden) why.push(_('network forbidden for this SIM'));
 				dom.content(elReg, [
-					E('strong', {}, op.state === 'absent' ? _('No modem detected') : _('No service')),
-					' — ' + why.join(' · ') + '. ',
-					E('span', { 'style': 'opacity: 0.85;' }, op.state === 'absent' ? '' :
-						_('The cell and signal readings below are what the radio hears, not a working connection to your SIM\'s network.'))
+					E('div', {}, [ E('strong', {}, op.state === 'absent' ? _('No modem detected.') : _('No service.')), ' ', noServiceReason(op, reg, simPlmn) ]),
+					op.state === 'absent' ? '' : E('div', { 'style': 'margin-top: 4px; font-size: 11px; opacity: 0.75;' },
+						_('Details') + ': ' + [
+							_('registration') + ' ' + (reg.state || op.reg_state || '--'),
+							reg.plmn ? _('camped PLMN') + ' ' + reg.plmn : null,
+							simPlmn ? _('SIM PLMN') + ' ' + simPlmn : null,
+							reg.status ? _('service') + ' ' + reg.status : null,
+							reg.forbidden ? _('forbidden') : null
+						].filter(function(x) { return x; }).join(' · '))
 				]);
 				elReg.style.display = '';
 			}
 		}
+
+		// While unregistered the gauges describe a cell the SIM cannot use:
+		// say whose cell it is and mute the green "Good/Strong" grades.
+		var elGTitle = document.getElementById('rf-gauges-title');
+		if (elGTitle) {
+			elGTitle.textContent = noSvc
+				? (reg.plmn ? _('Signal of %s cell (not usable)').format(plmnLabel(reg.plmn)) : _('Signal (no service)'))
+				: _('Radio Signal Quality Gauges');
+		}
+		var elGCard = document.getElementById('rf-gauges-card');
+		if (elGCard) elGCard.classList.toggle('rf-nosvc', noSvc);
 
 		var elEnb = document.getElementById('rf-enb-val');
 		if (elEnb) elEnb.textContent = s.enb || '--';
@@ -269,7 +319,7 @@ return view.extend({
 		var elTac = document.getElementById('rf-tac-val');
 		if (elTac) elTac.textContent = (s.tac_hex && s.tac_hex !== '--') ? s.tac_hex + ' (' + s.tac_dec + ')' : '--';
 
-		// 2. Radio Signal Quality Gauges (5 Metrik Padat)
+		// 2. Radio Signal Quality Gauges (5 metrics)
 		this.updateGauge('rsrp', sig.rsrp, 'rf-rsrp-val', 'rf-rsrp-badge', 'rf-rsrp-bar', 'dBm');
 		this.updateGauge('sinr', sig.snr, 'rf-sinr-val', 'rf-sinr-badge', 'rf-sinr-bar', 'dB');
 		this.updateGauge('rsrq', sig.rsrq, 'rf-rsrq-val', 'rf-rsrq-badge', 'rf-rsrq-bar', 'dB');
@@ -602,6 +652,9 @@ return view.extend({
 
 		// Main View Layout
 		var viewRoot = E('div', { 'class': 'cbi-map', 'style': 'padding-bottom: 30px;' }, [
+			// No service: grades and bars describe an unusable cell, so mute them.
+			E('style', {}, '#rf-gauges-card.rf-nosvc .badge, #rf-gauges-card.rf-nosvc [id$="-bar"] { filter: grayscale(1); opacity: 0.45; }'),
+
 			// 1. Header & Live Diagnostics Toolbar
 			E('div', {
 				'style': 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; border-bottom: 1px solid var(--border-color-medium); padding-bottom: 12px;'
@@ -687,9 +740,9 @@ return view.extend({
 				]),
 
 				// Column B: Compact 5-Gauge Signal Quality Meter
-				E('div', { 'class': 'cbi-section rf-cockpit-card', 'style': 'margin: 0; padding: 14px 18px;' }, [
+				E('div', { 'id': 'rf-gauges-card', 'class': 'cbi-section rf-cockpit-card', 'style': 'margin: 0; padding: 14px 18px;' }, [
 					E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;' }, [
-						E('h3', { 'style': 'margin: 0; font-size: 14px;' }, _('Radio Signal Quality Gauges')),
+						E('h3', { 'id': 'rf-gauges-title', 'style': 'margin: 0; font-size: 14px;' }, _('Radio Signal Quality Gauges')),
 						E('span', { 'style': 'font-size: 11px; color: var(--text-color-medium);' }, _('3GPP Standards'))
 					]),
 					E('div', { 'style': 'display: flex; flex-direction: column;' }, [
