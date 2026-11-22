@@ -4940,41 +4940,6 @@ body.modal-overlay-active #modal_overlay {
     opacity: 1;
 }
 
-#mainmenu .menu-close {
-    display: none !important;
-}
-
-@media (max-width: 800px) {
-    #mainmenu .menu-close {
-        position: absolute;
-        top: 16px;
-        right: 16px;
-        width: 36px;
-        height: 36px;
-        display: flex !important;
-        align-items: center;
-        justify-content: center;
-        background: var(--proton-bg-hover);
-        border: 1px solid var(--proton-border);
-        border-radius: 8px;
-        color: var(--proton-fg-secondary);
-        cursor: pointer;
-        transition: var(--proton-transition);
-        font-size: 1.25rem;
-        line-height: 1;
-    }
-
-    #mainmenu .menu-close:hover {
-        background: var(--proton-bg-hover);
-        color: var(--proton-fg);
-        border-color: var(--proton-border);
-    }
-
-    #mainmenu .menu-close:active {
-        transform: scale(0.95);
-    }
-}
-
 @media (max-width: 800px) {
     html {
         overflow-x: hidden;

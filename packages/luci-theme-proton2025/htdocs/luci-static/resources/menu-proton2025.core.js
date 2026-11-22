@@ -759,9 +759,6 @@ return baseclass.extend({
     else if (typeof mq.addListener === "function")
       mq.addListener((ev) => onViewportChange(ev.matches));
 
-    if (mq.matches) {
-      this.addMobileMenuCloseButton();
-    }
 
     this.renderModeMenu(node);
 
@@ -1038,24 +1035,6 @@ return baseclass.extend({
     document.body.style.overflow = "";
   },
 
-  addMobileMenuCloseButton() {
-    if (window.innerWidth > 800) return;
-    const mainmenu = document.querySelector("#mainmenu");
-    if (!mainmenu) return;
-
-    if (mainmenu.querySelector(".menu-close")) return;
-
-    const closeBtn = document.createElement("button");
-    closeBtn.className = "menu-close";
-    closeBtn.innerHTML =
-      '<svg class="proton-mobile-menu-icon" viewBox="0 0 24 24" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>';
-    closeBtn.setAttribute("aria-label", "Close menu");
-    closeBtn.addEventListener("click", () => {
-      this.closeMobileMenu();
-    });
-
-    mainmenu.insertBefore(closeBtn, mainmenu.firstChild);
-  },
 
   setupMobileTableTitles() {
     const updateTitles = () => {

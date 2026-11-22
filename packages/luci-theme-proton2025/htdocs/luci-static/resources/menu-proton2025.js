@@ -774,7 +774,6 @@ return baseclass.extend({
       );
       if (isMobile) {
         this.ensureMobileMenuIcon();
-        this.addMobileMenuCloseButton();
       }
     };
     this.ensureMenuPlacement(mq.matches);
@@ -784,7 +783,6 @@ return baseclass.extend({
       mq.addListener((ev) => onViewportChange(ev.matches));
 
     this.ensureMobileMenuIcon();
-    this.addMobileMenuCloseButton();
 
     this.renderModeMenu(node);
 
@@ -1129,23 +1127,6 @@ return baseclass.extend({
     this.updateMobileMenuIcon(false);
   },
 
-  addMobileMenuCloseButton() {
-    if (window.innerWidth > 800) return;
-    const mainmenu = document.querySelector("#mainmenu");
-    if (!mainmenu) return;
-
-    if (mainmenu.querySelector(".menu-close")) return;
-
-    const closeBtn = document.createElement("button");
-    closeBtn.className = "menu-close";
-    closeBtn.appendChild(this.buildMobileMenuIcon(true));
-    closeBtn.setAttribute("aria-label", "Close menu");
-    closeBtn.addEventListener("click", () => {
-      this.closeMobileMenu();
-    });
-
-    mainmenu.insertBefore(closeBtn, mainmenu.firstChild);
-  },
 
   buildMobileMenuIcon(close) {
     const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");

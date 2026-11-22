@@ -201,7 +201,9 @@ log "Rootfs: $(basename "$ROOTFS")"
 log "Bundle: $(basename "$ZIP")"
 
 # Extract the Qualcomm .mbn firmware from the bundle.
-MBN="$(mktemp -d)"; trap 'rm -rf "$MBN" "$GPTTMP"; [[ -n "$SAVED" && "$RADIO_SRC" != "2" ]] && rm -rf "$SAVED"' EXIT
+# SAVED is never deleted: it is either the unit's permanent backup under
+# backup/units/<serial>/ or a backup folder the user picked.
+MBN="$(mktemp -d)"; trap 'rm -rf "$MBN" "$GPTTMP"' EXIT
 GPTTMP=""; SAVED=""
 log "Extracting .mbn firmware from $(basename "$ZIP")…"
 unzip -q -j -d "$MBN" "$ZIP" "*.mbn"
@@ -215,7 +217,9 @@ echo
 warn "This ERASES the OpenWrt overlay / any existing config on the dongle."
 echo "Choose radio/modem partitions source ($RADIO):"
 echo "  1) Read live from connected dongle (default - preserves current dongle state)"
-echo "  2) Restore from local radio/stock backup (./backup/*)"
+echo "  2) Restore from local radio/stock backup (./backup/units/<serial>/*, ./backup/*)"
+echo "     Either way, this unit's live radio data is first saved permanently to"
+echo "     ./backup/units/<chip serial>/ (see: python3 radio_backup.py list)."
 read -r -p "Select source [1/2] (default 1): " RADIO_SRC
 RADIO_SRC="${RADIO_SRC:-1}"
 
@@ -230,8 +234,17 @@ if [[ "$RADIO_SRC" == "2" ]]; then
     }
 
     RADIO_DIRS=()
+    # Per-unit backups (newest first), then legacy flat folders.
+    shopt -s nullglob
+    unit_dirs=(backup/units/*/*/)
+    shopt -u nullglob
+    for (( k=${#unit_dirs[@]}-1; k>=0; k-- )); do
+        b_clean="${unit_dirs[$k]%/}"
+        if validate_radio_dir "$b_clean"; then RADIO_DIRS+=("$b_clean"); fi
+    done
     for b_dir in backup/*/; do
         b_clean="${b_dir%/}"
+        [[ "$b_clean" == "backup/units" ]] && continue
         if [[ -d "$b_clean" ]] && validate_radio_dir "$b_clean"; then
             RADIO_DIRS+=("$b_clean")
         fi
@@ -266,16 +279,39 @@ fi
 read -r -p "Continue flashing? (y/N): " c; [[ "$c" =~ ^[Yy]$ ]] || { log "Cancelled."; exit 0; }
 
 ensure_edl
+ensure_python
 enter_edl
+
+# Always save this unit's live radio + boot chain permanently FIRST, filed by
+# chip serial (backup/units/<serial>/<timestamp>/). It must be the first edl
+# call of the session: only then does edl report the serial.
+log "Backing up this unit's radio partitions (filed by chip serial)…"
+LIVE="$("$PY" -I radio_backup.py backup --edl "$EDL" --print-path)" \
+    || die "radio backup failed — nothing has been written to the dongle"
+[[ -d "$LIVE" ]] || die "radio backup returned no folder — nothing has been written to the dongle"
+log "This unit's backup: $LIVE"
 
 SAVED=""
 if [[ "$RADIO_SRC" == "2" ]]; then
+    # Restoring another unit's radio data clones its IMEI: refuse by default.
+    rc=0; "$PY" -I radio_backup.py check "$STOCK_DIR" --against "$LIVE" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if [[ $rc -eq 2 ]]; then
+            warn "That backup belongs to ANOTHER dongle — restoring it clones that unit's IMEI."
+        else
+            warn "That backup has no serial record — it may belong to another dongle."
+        fi
+        read -r -p "Type YES to restore it anyway: " c
+        if [[ "$c" != "YES" ]]; then
+            log "Cancelled — nothing written. This unit's own backup: $LIVE"
+            "$EDL" reset || warn "edl reset failed — power-cycle the dongle manually"
+            exit 0
+        fi
+    fi
     SAVED="$STOCK_DIR"
-    log "Skipping live radio backup; will restore from $STOCK_DIR"
+    log "Will restore radio partitions from $STOCK_DIR"
 else
-    SAVED="$(mktemp -d)"
-    log "Backing up radio partitions from this unit…"
-    for n in $RADIO; do log "  read $n"; "$EDL" r "$n" "$SAVED/$n.bin" || die "backup of $n failed"; done
+    SAVED="$LIVE"
 fi
 
 log "Flashing GPT (raw sector writes)…"

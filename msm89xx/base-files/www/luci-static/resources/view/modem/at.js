@@ -21,7 +21,7 @@ return view.extend({
 		let outputBox = document.getElementById('at-output');
 		if (btn) btn.disabled = true;
 
-		fs.exec('/usr/bin/mmcli', ['-m', '0', '--command=' + cmd]).then(function(res) {
+		fs.exec('/usr/bin/mmcli', ['-m', 'any', '--command=' + cmd]).then(function(res) {
 			if (outputBox) {
 				outputBox.style.display = 'block';
 				let txt = res.stdout || res.stderr || '';

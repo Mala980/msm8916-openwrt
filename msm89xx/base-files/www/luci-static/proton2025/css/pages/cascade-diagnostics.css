@@ -1,5 +1,0 @@
-body[data-page="admin-network-diagnostics"] .table,
-body[data-page="admin-network-diagnostics"] .tr,
-body[data-page="admin-network-diagnostics"] .td {
-    overflow: visible !important;
-}

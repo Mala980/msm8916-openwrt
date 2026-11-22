@@ -754,6 +754,45 @@ save_diffconfig() {
 }
 
 
+# Force a rebuild of every in-repo package whose sources live in packages/
+# (i.e. no PKG_SOURCE download). OpenWrt only rebuilds a package when the
+# path+mtime hash of its directory changes, and a stale .apk/.ipk left in bin/
+# can otherwise end up in the image -- this is how an old luci-theme-proton2025
+# (without the toast hook) shipped while base-files was current. These packages
+# are small, so cleaning them on every build is cheap insurance.
+clean_local_packages() {
+
+    local pkg name goals="" shadow
+
+    # A same-named package anywhere else under openwrt/package (e.g. a manual
+    # copy at package/luci-theme-proton2025) shadows ours: OpenWrt builds that
+    # one and package/msm8916/<name> is silently ignored. Refuse to build.
+    for pkg in "$REPO_DIR"/packages/*/; do
+
+        name="$(basename "$pkg")"
+
+        shadow="$(find "$OPENWRT_DIR/package" -mindepth 1 -maxdepth 3 -type d \
+                    -name "$name" -not -path "$OPENWRT_DIR/package/msm8916/*" \
+                    2>/dev/null | sed -n '1p')"
+
+        [ -z "$shadow" ] ||
+            die "Package '$name' is shadowed by ${shadow#$REPO_DIR/} -- remove it; OpenWrt would build that copy instead of packages/$name."
+    done
+
+    for pkg in "$REPO_DIR"/packages/*/; do
+
+        name="$(basename "$pkg")"
+
+        [ -f "$pkg/Makefile" ] || continue
+        grep -q '^PKG_SOURCE' "$pkg/Makefile" && continue
+
+        goals="$goals package/msm8916/$name/clean"
+    done
+
+    [ -n "$goals" ] || return 0
+
+    run_openwrt_make "make$goals V=s"
+}
 
 build_target() {
 
@@ -776,6 +815,10 @@ build_target() {
     if [ "$clean" -eq 1 ]; then
 
         run_openwrt_make "make clean V=sc"
+
+    else
+
+        clean_local_packages
 
     fi
 

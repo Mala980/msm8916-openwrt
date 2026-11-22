@@ -152,6 +152,11 @@ cd <repository-root>
 
 # Restore factory firmware:
 [EDL]  ./restore-stock.sh     # roll back from backup
+
+# Per-unit radio backups (filed by chip serial):
+[EDL]  python3 radio_backup.py backup --edl <edl>   # manual backup (flash-firmware.sh does this itself)
+       python3 radio_backup.py list                 # show units and backups
+       python3 radio_backup.py verify <backup-dir>  # re-check SHA-256 of a backup
 ```
 
 `[EDL]` denotes that the dongle must be placed in EDL mode (D+/GND bridge during
@@ -313,6 +318,33 @@ http://192.168.1.1
 ```
 
 Log in as `root` with an empty password. This is the OpenWrt-Liberty interface.
+
+---
+
+## Per-unit radio backups
+
+Each dongle's `modemst1`, `modemst2`, `fsg`, `fsc`, `sec`, `persist` and `modem`
+partitions hold data that exists nowhere else: its IMEI and RF calibration.
+`flash-firmware.sh` therefore saves them, together with the stock boot chain
+(`sbl1`, `aboot`, `rpm`, `tz`, `hyp`), **before it writes anything**:
+
+```
+backup/units/<chip serial>/unit.json
+backup/units/<chip serial>/<YYYYmmdd-HHMMSS>/*.bin + manifest.json (SHA-256)
+```
+
+- The chip serial is the SoC serial `edl` prints when the dongle enters EDL
+  (`Serial: 0x242efec7`), so backups of different dongles never mix.
+- A backup identical to the unit's previous one is not stored twice.
+- These folders are never deleted by the scripts. `backup/` is gitignored —
+  copy it somewhere safe as well.
+- When you choose *Restore from local backup*, the script compares the backup's
+  serial with the connected dongle. A backup from another unit (or one with no
+  serial record) is refused unless you type `YES`, because restoring it clones
+  that unit's IMEI.
+
+To file an older backup folder under a serial:
+`python3 radio_backup.py import backup/<folder> --serial 0x<serial>`.
 
 ---
 

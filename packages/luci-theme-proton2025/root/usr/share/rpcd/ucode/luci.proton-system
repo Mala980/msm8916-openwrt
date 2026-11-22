@@ -388,6 +388,50 @@ function getHardwareProfile() {
 	return hw;
 }
 
+// Raw operator name straight from the modem: the quoted <oper> field of
+// `AT+COPS?` in long alphanumeric format (e.g. "INDOSATOOREDOO").
+// Returns the name, "" when the modem answers but is not registered (no
+// <oper> field), or null when the AT command itself fails -- the caller then
+// falls back to ModemManager's operator-name. Requires ModemManager --debug
+// (always set by /etc/init.d/modemmanager). Cached briefly because the status
+// bar polls every 2.5 s per open tab.
+const COPS_CACHE = "/tmp/.proton_cops_cache";
+const COPS_TTL = 15;
+
+function atCommand(cmd) {
+	let p = popen(sprintf("mmcli -m any --command='%s' 2>/dev/null", cmd));
+	let out = p ? p.read("all") : "";
+	if (p) p.close();
+	let m = match(out || "", /response: '(.*)'/);
+	return m ? m[1] : null;
+}
+
+function getRawOperatorName() {
+	let now = time();
+	let cached = readfile(COPS_CACHE);
+	if (cached) {
+		let c = split(trim(cached), "\t");
+		if (length(c) >= 1 && now - int(c[0]) < COPS_TTL)
+			return length(c) >= 2 ? c[1] : "";
+	}
+
+	let resp = atCommand("AT+COPS?");
+	if (resp == null) return null;
+
+	// +COPS: <mode>[,<format>,"<oper>"[,<AcT>]]
+	let m = match(resp, /\+COPS: *[0-9]+, *([0-9]+), *"([^"]*)"/);
+	if (m && m[1] != "0") {
+		// Someone switched the response format to short/numeric; restore long.
+		atCommand("AT+COPS=3,0");
+		resp = atCommand("AT+COPS?");
+		m = resp ? match(resp, /\+COPS: *[0-9]+, *([0-9]+), *"([^"]*)"/) : null;
+	}
+
+	let name = (m && m[1] == "0") ? trim(m[2]) : "";
+	writefile(COPS_CACHE, sprintf("%d\t%s\n", now, name));
+	return name;
+}
+
 function getTelemetry() {
 	// 1. CPU Temperature
 	let temp_raw = readfile("/sys/class/thermal/thermal_zone3/temp") || readfile("/sys/class/thermal/thermal_zone4/temp") || "0";
@@ -451,6 +495,11 @@ function getTelemetry() {
 			else if (k == "modem.generic.state") state = v;
 		}
 	}
+
+	// Prefer the raw AT+COPS? name; "" (not registered) shows "Searching" in
+	// the UI instead of a numeric PLMN such as "510 09".
+	let raw_op = getRawOperatorName();
+	if (raw_op != null) op_name = raw_op;
 
 	let bars = 0;
 	if (signal_val > 80) bars = 5;
@@ -560,6 +609,89 @@ function getSignalDetails() {
 		persisted_bands: saved_uci_bands || "all",
 		neighbors: cell_res.neighbors
 	};
+}
+
+function getTTL() {
+	let enabled = false;
+	let value = 64;
+	try {
+		let u = cursor();
+		if (u) {
+			u.load("firewall");
+			u.foreach("firewall", "include", function(s) {
+				if (s.path == "/etc/firewall.ttl") {
+					enabled = true;
+				}
+			});
+		}
+	} catch(e) {}
+
+	let f_content = readfile("/etc/firewall.ttl");
+	if (f_content) {
+		let m = match(f_content, /ip ttl set ([0-9]+)/);
+		if (m) value = int(m[1]);
+	}
+
+	return {
+		enabled: enabled,
+		value: value
+	};
+}
+
+function setTTL(params) {
+	let enabled = params && (params.enabled == 1 || params.enabled == "1" || params.enabled === true);
+	let value = params && params.value ? int(params.value) : 64;
+	if (value <= 0 || value > 255) value = 64;
+
+	if (enabled) {
+		let nft_script = sprintf(
+			"table inet fw4 {\n" +
+			"    chain mangle_forward_ttl {\n" +
+			"        type filter hook forward priority mangle; policy accept;\n" +
+			"        ip ttl set %d\n" +
+			"        ip6 hoplimit set %d\n" +
+			"    }\n" +
+			"}\n", value, value
+		);
+		writefile("/etc/firewall.ttl", nft_script);
+
+		try {
+			let u = cursor();
+			if (u) {
+				u.load("firewall");
+				let found = false;
+				u.foreach("firewall", "include", function(s) {
+					if (s.path == "/etc/firewall.ttl") found = true;
+				});
+				if (!found) {
+					let sid = u.add("firewall", "include");
+					u.set("firewall", sid, "path", "/etc/firewall.ttl");
+					u.set("firewall", sid, "type", "nftables");
+					u.set("firewall", sid, "position", "ruleset-append");
+					u.commit("firewall");
+				}
+			}
+		} catch(e) {}
+
+		system("nft -f /etc/firewall.ttl 2>/dev/null || /etc/init.d/firewall restart >/dev/null 2>&1");
+	} else {
+		try {
+			let u = cursor();
+			if (u) {
+				u.load("firewall");
+				u.foreach("firewall", "include", function(s) {
+					if (s.path == "/etc/firewall.ttl") {
+						u.delete("firewall", s[".name"]);
+					}
+				});
+				u.commit("firewall");
+			}
+		} catch(e) {}
+
+		system("rm -f /etc/firewall.ttl && nft delete chain inet fw4 mangle_forward_ttl 2>/dev/null || /etc/init.d/firewall restart >/dev/null 2>&1");
+	}
+
+	return { success: true, enabled: enabled, value: value };
 }
 
 function setBandLock(params) {
@@ -686,6 +818,17 @@ const methods = {
 	getSignalDetails: {
 		call: function() {
 			return getSignalDetails();
+		}
+	},
+	getTTL: {
+		call: function() {
+			return getTTL();
+		}
+	},
+	setTTL: {
+		args: { enabled: "bool", value: "int" },
+		call: function(req) {
+			return setTTL(req.args);
 		}
 	},
 	setBandLock: {
