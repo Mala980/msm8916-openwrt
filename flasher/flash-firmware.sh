@@ -87,7 +87,15 @@ enter_edl() {
     for ip in 192.168.8.1 192.168.1.1; do
         if ping -c 1 -W 1000 "$ip" >/dev/null 2>&1; then
             log "Dongle reachable via IP $ip — sending reboot-edl over SSH…"
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 "root@$ip" "reboot-edl" 2>/dev/null || true
+            # reboot-edl tears down networking mid-session, so a foreground ssh
+            # never gets a clean close and hangs until TCP times out (the
+            # "stuck at Bringing down interfaces, had to Ctrl-C" bug). Detach
+            # the command so the remote shell returns at once, and add
+            # keepalives so ssh gives up within ~2s if the link drops first.
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o BatchMode=yes -o ConnectTimeout=5 \
+                -o ServerAliveInterval=1 -o ServerAliveCountMax=2 \
+                "root@$ip" "reboot-edl >/dev/null 2>&1 &" </dev/null >/dev/null 2>&1 || true
             wait_edl
             return
         fi
