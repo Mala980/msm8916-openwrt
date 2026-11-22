@@ -130,6 +130,24 @@
 				elClientsBox.title = 'Connected Clients: ' + c + ' device(s)';
 			}
 		}
+
+		// 6. SMS — inbox total, blink + dot while any unread remain
+		renderSms(d);
+	}
+
+	function renderSms(d) {
+		var elSms = document.getElementById('telem-sms');
+		var elBox = document.getElementById('telem-sms-box');
+		var elDot = document.getElementById('telem-sms-dot');
+		if (d.sms_inbox != null && elSms) elSms.textContent = parseInt(d.sms_inbox, 10) || 0;
+		var unread = parseInt(d.sms_unread, 10) || 0;
+		if (elBox) {
+			elBox.classList.toggle('telem-sms-new', unread > 0);
+			elBox.title = unread > 0
+				? unread + ' unread SMS (' + (parseInt(d.sms_inbox, 10) || 0) + ' in inbox)'
+				: 'SMS inbox: ' + (parseInt(d.sms_inbox, 10) || 0);
+		}
+		if (elDot) elDot.hidden = !(unread > 0);
 	}
 
 	function start() {

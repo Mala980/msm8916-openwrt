@@ -432,6 +432,33 @@ function getRawOperatorName() {
 	return name;
 }
 
+// SMS inbox + unread counts for the status bar. smsctl greps the JSONL
+// archive; cache briefly because getTelemetry is polled every 2.5 s per tab.
+const SMS_CACHE = "/tmp/.proton_sms_cache";
+const SMS_TTL = 10;
+
+function getSmsCounts() {
+	let now = time();
+	let cached = readfile(SMS_CACHE);
+	if (cached) {
+		let c = split(trim(cached), "\t");
+		if (length(c) >= 3 && now - int(c[0]) < SMS_TTL)
+			return { inbox: int(c[1]), unread: int(c[2]) };
+	}
+
+	let inbox = 0, unread = 0;
+	let p = popen("smsctl counts 2>/dev/null");
+	let raw = p ? p.read("all") : "";
+	if (p) p.close();
+	let mi = match(raw || "", /"inbox" *: *([0-9]+)/);
+	let mu = match(raw || "", /"unread" *: *([0-9]+)/);
+	if (mi) inbox = int(mi[1]);
+	if (mu) unread = int(mu[1]);
+
+	writefile(SMS_CACHE, sprintf("%d\t%d\t%d\n", now, inbox, unread));
+	return { inbox: inbox, unread: unread };
+}
+
 function getTelemetry() {
 	// 1. CPU Temperature
 	let temp_raw = readfile("/sys/class/thermal/thermal_zone3/temp") || readfile("/sys/class/thermal/thermal_zone4/temp") || "0";
@@ -533,6 +560,10 @@ function getTelemetry() {
 		ram_total: ram_total_mb,
 		clients: client_count
 	};
+
+	let sms = getSmsCounts();
+	res.sms_inbox = sms.inbox;
+	res.sms_unread = sms.unread;
 
 	writefile("/tmp/.telemetry_cache.json", sprintf("%J\n", res));
 	return res;

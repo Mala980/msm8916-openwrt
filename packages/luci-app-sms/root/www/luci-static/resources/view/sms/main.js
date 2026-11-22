@@ -151,6 +151,8 @@ return view.extend({
 				ctl('counts').catch(function() { return {}; }),
 				ctl('contacts').catch(function() { return { contacts: [] }; }),
 				ctl('sims').catch(function() { return { mailboxes: [] }; }),
+				// Opening the mailbox clears the status-bar unread badge.
+				ctl('mark-read', 'all').catch(function() {}),
 				uci.load('sms')
 			]);
 		});

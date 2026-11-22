@@ -707,6 +707,17 @@ body {
 
 		<span class="telem-divider"></span>
 
+		<!-- 1b. SMS -->
+		<a href="{{ dispatcher.build_url('admin/modem/sms') }}" class="telem-item telem-sms" id="telem-sms-box" title="SMS">
+			<svg class="telem-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 4V6a2 2 0 0 1 2-2z"/></svg>
+			<span class="telem-sms-dot" id="telem-sms-dot" hidden></span>
+			<div class="telem-text">
+				<span class="telem-val" id="telem-sms">0</span>
+			</div>
+		</a>
+
+		<span class="telem-divider"></span>
+
 		<!-- 2. TEMPERATURE -->
 		<a href="{{ dispatcher.build_url('admin/status/realtime/temperature') }}" class="telem-item telem-temp" id="telem-temp-box" title="SoC Temperature">
 			<svg class="telem-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
@@ -763,6 +774,12 @@ body {
 			var cpu = document.getElementById('telem-cpu'); if (cpu && c.cpu_pct != null) cpu.textContent = c.cpu_pct + '%';
 			var ram = document.getElementById('telem-ram'); if (ram && c.ram_pct != null) ram.textContent = c.ram_pct + '%';
 			var cli = document.getElementById('telem-clients'); if (cli && c.clients != null) cli.textContent = c.clients;
+			var sms = document.getElementById('telem-sms'); if (sms && c.sms_inbox != null) sms.textContent = c.sms_inbox;
+			var smsBox = document.getElementById('telem-sms-box');
+			var smsDot = document.getElementById('telem-sms-dot');
+			var unread = parseInt(c.sms_unread, 10) || 0;
+			if (smsBox) smsBox.classList.toggle('telem-sms-new', unread > 0);
+			if (smsDot) smsDot.hidden = !(unread > 0);
 		}
 	} catch(e) {}
 })();
