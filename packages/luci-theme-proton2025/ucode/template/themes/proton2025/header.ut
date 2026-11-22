@@ -678,14 +678,17 @@ body {
 		if (__raw) __tc = json(__raw) || {};
 	} catch(e) {}
 	let __temp = __tc.temp ?? "52.0";
-	let __op = __tc.operator ?? "ModemRadar";
+	let __op = __tc.operator || "Searching";
 	let __sig = __tc.signal ?? 70;
-	let __bars = __tc.bars ?? 4;
-	let __rat = __tc.band ?? __tc.rat ?? "LTE";
+	let __nosvc = (__tc.service === false);
+	let __bars = __tc.bars ?? 0;
+	let __rat = __tc.label ?? __tc.band ?? __tc.rat ?? "—";
 	let __cpu = __tc.cpu_pct ?? 8;
 	let __ram = __tc.ram_pct ?? 30;
 	let __cli = __tc.clients ?? 1;
-	let __tip = (__tc.band && __tc.rsrp) ? sprintf("Band: %s | EARFCN: %s | PCI: %s | RSRP: %s dBm | RSRQ: %s dB | RSSI: %s dBm | SINR: %s dB", __tc.band, __tc.earfcn || "", __tc.pci || "", __tc.rsrp, __tc.rsrq || "", __tc.rssi || "", __tc.snr || "") : "Cellular 4G LTE Signal & Band Lock";
+	let __tip = __nosvc ? sprintf("Cellular: no service%s", __tc.reg_state ? " (registration: " + __tc.reg_state + ")" : "")
+		: __tc.rsrp ? sprintf("%s%s | RSRP: %s dBm | RSRQ: %s dB | RSSI: %s dBm | SINR: %s dB", __tc.label || "", __tc.band ? sprintf(" | EARFCN: %s | PCI: %s", __tc.earfcn || "", __tc.pci || "") : "", __tc.rsrp, __tc.rsrq || "", __tc.rssi || "", __tc.snr || "")
+		: "Cellular Signal & Band Lock";
 -%}
 <div id="proton-telemetry-strip">
 	<div class="telemetry-inner">
@@ -700,8 +703,8 @@ body {
 			</div>
 			<div class="telem-text">
 				<span class="telem-val" id="telem-operator">{{ __op }}</span>
-				<span class="telem-badge" id="telem-rat">{{ __rat }}</span>
-				<span class="telem-sub" id="telem-signal-pct">{{ __sig }}%</span>
+				<span class="telem-badge{{ __nosvc ? ' telem-badge-nosvc' : '' }}" id="telem-rat">{{ __rat }}</span>
+				<span class="telem-sub" id="telem-signal-pct">{{ __nosvc ? '' : __sig + '%' }}</span>
 			</div>
 		</a>
 
@@ -764,11 +767,14 @@ body {
 		if (c) {
 			var s = document.getElementById('telem-signal-stairs'); if (s && c.bars != null) s.setAttribute('data-bars', c.bars);
 			var op = document.getElementById('telem-operator'); if (op && c.operator) op.textContent = c.operator;
-			var rat = document.getElementById('telem-rat'); if (rat) rat.textContent = c.band || c.rat || 'LTE';
-			var sig = document.getElementById('telem-signal-pct'); if (sig && c.signal != null) sig.textContent = c.signal + '%';
+			var nosvc = (c.service === false);
+			var rat = document.getElementById('telem-rat'); if (rat) { rat.textContent = (c.label != null) ? c.label : (c.band || c.rat || '—'); rat.classList.toggle('telem-badge-nosvc', nosvc); }
+			var sig = document.getElementById('telem-signal-pct'); if (sig && c.signal != null) sig.textContent = nosvc ? '' : c.signal + '%';
 			var box = document.getElementById('telem-signal-box');
-			if (box && c.band && c.rsrp) {
-				box.title = 'Band: ' + c.band + ' | EARFCN: ' + (c.earfcn || '') + ' | PCI: ' + (c.pci || '') + ' | RSRP: ' + c.rsrp + ' dBm | RSRQ: ' + (c.rsrq || '') + ' dB | RSSI: ' + (c.rssi || '') + ' dBm | SINR: ' + (c.snr || '') + ' dB';
+			if (box && nosvc) {
+				box.title = 'Cellular: no service' + (c.reg_state ? ' (registration: ' + c.reg_state + ')' : '');
+			} else if (box && c.rsrp) {
+				box.title = (c.label || '') + (c.band ? ' | EARFCN: ' + (c.earfcn || '') + ' | PCI: ' + (c.pci || '') : '') + ' | RSRP: ' + c.rsrp + ' dBm | RSRQ: ' + (c.rsrq || '') + ' dB | RSSI: ' + (c.rssi || '') + ' dBm | SINR: ' + (c.snr || '') + ' dB';
 			}
 			var temp = document.getElementById('telem-temp'); if (temp && c.temp) temp.textContent = c.temp + '°C';
 			var cpu = document.getElementById('telem-cpu'); if (cpu && c.cpu_pct != null) cpu.textContent = c.cpu_pct + '%';

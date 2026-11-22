@@ -11356,6 +11356,13 @@ body.login-page .login-password-toggle:focus-visible {
     border: 1px solid rgba(94, 158, 255, 0.3);
 }
 
+/* Not registered / no modem: muted grey instead of the accent blue */
+.telem-badge.telem-badge-nosvc {
+    background: rgba(148, 163, 184, 0.12);
+    color: #94a3b8;
+    border-color: rgba(148, 163, 184, 0.3);
+}
+
 /* Signal stairs icon (stairs / ladder) */
 .signal-stairs {
     display: flex;

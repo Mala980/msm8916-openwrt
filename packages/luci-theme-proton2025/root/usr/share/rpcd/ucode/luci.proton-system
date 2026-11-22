@@ -167,7 +167,8 @@ function getBandInfo(earfcn) {
 	} else if (e >= 39650 && e <= 41589) {
 		return { code: "B41", freq: "2500", name: "Band 41 (2500 MHz - TDD)", dl: sprintf("%.1f MHz", 2496.0 + 0.1 * (e - 39650)), ul: sprintf("%.1f MHz", 2496.0 + 0.1 * (e - 39650)), duplex: "TDD" };
 	}
-	return { code: "LTE", freq: "", name: "LTE (EARFCN " + earfcn + ")", dl: "--", ul: "--", duplex: "LTE" };
+	// EARFCN outside the table above: report it, but don't invent a band.
+	return { code: "", freq: "", name: "Unknown band (EARFCN " + earfcn + ")", dl: "--", ul: "--", duplex: "" };
 }
 
 function formatBytes(bytes) {
@@ -210,10 +211,10 @@ function parseCellInfo() {
 	let cell_data = cell_raw ? json(cell_raw) : null;
 
 	let serving = {
-		band: "LTE", freq: "", band_name: "LTE", earfcn: "", pci: "",
+		band: "", freq: "", band_name: "", earfcn: "", pci: "",
 		cell_id: "", cell_id_hex: "--", cell_id_dec: "--",
 		enb: "--", sector: "--", tac: "", tac_hex: "--", tac_dec: "--",
-		rsrp: "", rsrq: "", dl: "--", ul: "--", duplex: "LTE"
+		rsrp: "", rsrq: "", dl: "--", ul: "--", duplex: ""
 	};
 	let neighbors = [];
 
@@ -233,7 +234,9 @@ function parseCellInfo() {
 					else if (k == "rsrq") item.rsrq = sprintf("%.1f", int(v));
 				}
 			}
-			let b = getBandInfo(item.earfcn);
+			// An empty EARFCN would parse as 0 and come out as B1.
+			let b = (item.earfcn != "") ? getBandInfo(item.earfcn)
+				: { code: "", freq: "", name: "", dl: "--", ul: "--", duplex: "" };
 			item.band = b.code;
 			item.freq = b.freq;
 			item.band_name = b.name;
@@ -322,12 +325,12 @@ function getCarrierSession() {
 	let rx_bytes = trim(readfile("/sys/class/net/wwan0/statistics/rx_bytes") || "0");
 	let tx_bytes = trim(readfile("/sys/class/net/wwan0/statistics/tx_bytes") || "0");
 
-	let apn = "internet";
+	let apn = "--";
 	try {
 		let u = cursor();
 		if (u) {
 			u.load("network");
-			apn = u.get("network", "modem", "apn") || "internet";
+			apn = u.get("network", "modem", "apn") || "--";
 		}
 	} catch(e) {}
 
@@ -336,18 +339,48 @@ function getCarrierSession() {
 		ip: ip,
 		gateway: gw,
 		dns: dns,
-		mtu: 1500,
+		mtu: int(trim(readfile("/sys/class/net/wwan0/mtu") || "0")) || "--",
 		uptime: formatDuration(uptime_sec),
 		rx: formatBytes(rx_bytes),
 		tx: formatBytes(tx_bytes)
 	};
 }
 
+// Modem DSP (remoteproc "4080000.remoteproc") state, recovery mode and crash
+// count since boot, from sysfs and the kernel log -- nothing assumed.
+function getModemWatchdog() {
+	let rp = null;
+	for (let d in (lsdir("/sys/class/remoteproc") || [])) {
+		if (index(readFileContent("/sys/class/remoteproc/" + d + "/name") || "", "4080000") == 0) {
+			rp = "/sys/class/remoteproc/" + d;
+			break;
+		}
+	}
+	if (!rp) return "--";
+
+	let st = readFileContent(rp + "/state") || "unknown";
+	let rec = readFileContent(rp + "/recovery");
+	let crashes = 0;
+	let p = popen("dmesg 2>/dev/null | grep -c 'crash detected in 4080000'");
+	if (p) { crashes = int(trim(p.read("all") || "0")); p.close(); }
+
+	return sprintf("Modem DSP %s%s, %d crash%s since boot", st,
+		rec ? ", recovery " + rec : "", crashes, crashes == 1 ? "" : "es");
+}
+
+// IMEI / SIM details barely change, but Change IMEI rewrites the IMEI at
+// runtime, so the cache must expire instead of living until reboot.
+const HW_CACHE = "/tmp/.modem_hw_cache.json";
+const HW_TTL = 30;
+
 function getHardwareProfile() {
-	let cached = readfile("/tmp/.modem_hw_cache.json");
+	let cached = readfile(HW_CACHE);
 	if (cached) {
 		let j = json(cached);
-		if (j && j.imei && j.imei != "--") return j;
+		if (j && j.imei && j.imei != "--" && time() - int(j.ts || 0) < HW_TTL) {
+			j.watchdog = getModemWatchdog();
+			return j;
+		}
 	}
 
 	let p_sim = popen("mmcli -i any --output-keyvalue 2>/dev/null");
@@ -382,9 +415,10 @@ function getHardwareProfile() {
 		imsi: imsi,
 		iccid: iccid,
 		revision: fw_revision,
-		watchdog: "Remoteproc SSR Protected (0 Failures)"
+		ts: time()
 	};
-	if (imei != "--") writefile("/tmp/.modem_hw_cache.json", sprintf("%J\n", hw));
+	if (imei != "--") writefile(HW_CACHE, sprintf("%J\n", hw));
+	hw.watchdog = getModemWatchdog();
 	return hw;
 }
 
@@ -459,6 +493,58 @@ function getSmsCounts() {
 	return { inbox: inbox, unread: unread };
 }
 
+// Status-bar cellular summary: what the modem is really doing, never a guess.
+//   rat     "4G" / "3G" / "2G" from ModemManager's access technology ("" if unknown)
+//   band    "B3" etc. only when the serving cell's EARFCN was actually read
+//   label   "4G B3", "4G", "No Service" (not registered) or "—" (no modem)
+//   bars    0-5. LTE: from RSRP, minus 1 if SNR < 0 dB, minus 2 if SNR < -5 dB
+//           (min 1). Otherwise ModemManager's RSSI-based signal quality.
+//           0 whenever not registered.
+// ModemManager's signal-quality % is RSSI-based and reads 80 %+ on a cell
+// with RSRP -112 dBm / SNR -9 dB, so it is only the fallback.
+function ratFromAccessTech(at) {
+	at = lc(at || "");
+	if (match(at, /lte|5gnr/)) return "4G";
+	if (match(at, /umts|hsdpa|hsupa|hspa|tds/)) return "3G";
+	if (match(at, /gsm|gprs|edge/)) return "2G";
+	return "";
+}
+
+function lteBars(rsrp, snr) {
+	let r = +rsrp;
+	let bars = (r >= -85) ? 5 : (r >= -95) ? 4 : (r >= -105) ? 3 : (r >= -115) ? 2 : 1;
+	if (snr != null && snr != "") {
+		let s = +snr;
+		if (s < -5) bars -= 2;
+		else if (s < 0) bars -= 1;
+	}
+	return bars < 1 ? 1 : bars;
+}
+
+function qualityBars(q) {
+	q = int(q);
+	return (q > 80) ? 5 : (q > 60) ? 4 : (q > 40) ? 3 : (q > 20) ? 2 : (q > 0) ? 1 : 0;
+}
+
+function cellStatus(c) {
+	if (!c.have_modem)
+		return { rat: "", band: "", label: "—", service: false, bars: 0 };
+
+	let registered = (c.reg_state == "home" || c.reg_state == "roaming");
+	if (!registered)
+		return { rat: "", band: "", label: "No Service", service: false, bars: 0 };
+
+	let rat = ratFromAccessTech(c.access_tech);
+	// An empty EARFCN parses as 0 and getBandInfo() would call it B1.
+	let band = (c.earfcn != null && c.earfcn != "" && c.band) ? c.band : "";
+	if (rat == "") rat = band ? "4G" : "";
+
+	let bars = (rat == "4G" && c.rsrp != null && c.rsrp != "") ? lteBars(c.rsrp, c.snr) : qualityBars(c.signal);
+	let label = rat ? (band ? rat + " " + band : rat) : (band || "—");
+
+	return { rat: rat, band: band, label: label, service: true, bars: bars };
+}
+
 function getTelemetry() {
 	// 1. CPU Temperature
 	let temp_raw = readfile("/sys/class/thermal/thermal_zone3/temp") || readfile("/sys/class/thermal/thermal_zone4/temp") || "0";
@@ -512,7 +598,9 @@ function getTelemetry() {
 	let kv_raw = p_kv ? p_kv.read("all") : "";
 	if (p_kv) p_kv.close();
 
-	let op_name = "ModemRadar", signal_val = 0, rat = serving.band || "4G", state = "connected";
+	let have_modem = (trim(kv_raw || "") != "");
+	let op_name = "", signal_val = 0, state = have_modem ? "unknown" : "absent";
+	let access_tech = "", reg_state = "";
 	for (let line in split(kv_raw, "\n")) {
 		let p = split(line, ":");
 		if (length(p) >= 2) {
@@ -520,6 +608,10 @@ function getTelemetry() {
 			if (k == "modem.3gpp.operator-name" && v != "--" && v != "") op_name = v;
 			else if (k == "modem.generic.signal-quality.value") signal_val = int(v);
 			else if (k == "modem.generic.state") state = v;
+			else if (k == "modem.3gpp.registration-state") reg_state = v;
+			// Plain "lte" / "umts, hsdpa", or a ".value[N]" list on some mmcli builds.
+			else if ((k == "modem.generic.access-technologies" || index(k, "modem.generic.access-technologies.value[") == 0) && v != "--" && v != "")
+				access_tech = access_tech ? access_tech + ", " + v : v;
 		}
 	}
 
@@ -528,22 +620,33 @@ function getTelemetry() {
 	let raw_op = getRawOperatorName();
 	if (raw_op != null) op_name = raw_op;
 
-	let bars = 0;
-	if (signal_val > 80) bars = 5;
-	else if (signal_val > 60) bars = 4;
-	else if (signal_val > 40) bars = 3;
-	else if (signal_val > 20) bars = 2;
-	else if (signal_val > 0) bars = 1;
-
 	let rsrp = sig_res.rsrp || serving.rsrp || "";
 	let rsrq = sig_res.rsrq || serving.rsrq || "";
+
+	let cell = cellStatus({
+		have_modem: have_modem,
+		reg_state: reg_state,
+		access_tech: access_tech,
+		earfcn: serving.earfcn,
+		band: serving.band,
+		rsrp: rsrp,
+		snr: sig_res.snr,
+		signal: signal_val
+	});
+
+	// ModemManager keeps the last operator name after the modem drops off the
+	// network; with no service the UI shows "Searching" instead.
+	if (!cell.service) op_name = "";
 
 	let res = {
 		operator: op_name,
 		signal: signal_val,
-		bars: bars,
-		rat: rat,
-		band: serving.band || "LTE",
+		bars: cell.bars,
+		rat: cell.rat,
+		label: cell.label,
+		service: cell.service,
+		reg_state: reg_state,
+		band: cell.band,
 		earfcn: serving.earfcn || "",
 		pci: serving.pci || "",
 		cell_id: serving.cell_id || "",
@@ -569,6 +672,33 @@ function getTelemetry() {
 	return res;
 }
 
+// Registration as the baseband itself reports it (QMI NAS serving system):
+// the PLMN the radio is camped on, and whether service there is limited or
+// forbidden. This is what explains "signal but no service".
+function parseServingSystem() {
+	let p = popen("qmicli -p -d /dev/wwan0qmi0 --nas-get-serving-system 2>/dev/null");
+	let raw = p ? p.read("all") : "";
+	if (p) p.close();
+
+	let r = { state: "", plmn: "", status: "", forbidden: false };
+	let mcc = "", mnc = "";
+	for (let line in split(raw || "", "\n")) {
+		let t = trim(line);
+		let m = match(t, /^Registration state: '([^']*)'/);
+		if (m) r.state = m[1];
+		m = match(t, /^MCC: '([0-9]+)'/);
+		if (m && mcc == "") mcc = m[1];
+		m = match(t, /^MNC: '([0-9]+)'/);
+		if (m && mnc == "") mnc = m[1];
+		m = match(t, /^Status: '([^']*)'/);
+		if (m) r.status = m[1];
+		m = match(t, /^Forbidden: '([^']*)'/);
+		if (m) r.forbidden = (m[1] == "yes");
+	}
+	if (mcc != "" && mnc != "") r.plmn = mcc + (length(mnc) == 1 ? "0" + mnc : mnc);
+	return r;
+}
+
 function getSignalDetails() {
 	let cell_res = parseCellInfo();
 	let sig_res = parseSignalInfo();
@@ -590,7 +720,7 @@ function getSignalDetails() {
 	if (p_kv) p_kv.close();
 
 	let current_bands = [];
-	let op_name = "ModemRadar", op_code = "51001", sig_quality = 0, state = "connected", reg_state = "home";
+	let op_name = "", op_code = "", sig_quality = 0, state = (trim(kv_raw || "") != "") ? "unknown" : "absent", reg_state = "unknown";
 
 	for (let line in split(kv_raw, "\n")) {
 		let p = split(line, ":");
@@ -616,15 +746,34 @@ function getSignalDetails() {
 
 	let bearer = getCarrierSession();
 	let hw = getHardwareProfile();
-	let csq = int((sig_quality * 31) / 100);
+	let reg = parseServingSystem();
+
+	// ModemManager keeps the last operator name/code after the modem drops
+	// off the network; only trust them while actually registered.
+	let registered = (reg_state == "home" || reg_state == "roaming");
+	if (!registered) { op_name = ""; op_code = ""; }
+	if (op_name == "--") op_name = "";
+	if (op_code == "--") op_code = "";
+
+	// The old IP/route stay on the interface until netifd notices; flag them.
+	bearer.stale = !registered && bearer.ip != "--";
+
+	// 3GPP TS 27.007 CSQ from the measured RSSI: (RSSI + 113) / 2, 0..31.
+	let csq = "--";
+	if (sig_res.rssi != "") {
+		let c = int((+sig_res.rssi + 113) / 2);
+		csq = c < 0 ? 0 : (c > 31 ? 31 : c);
+	}
 
 	return {
 		operator: {
 			name: op_name,
 			code: op_code,
 			state: state,
-			reg_state: reg_state
+			reg_state: reg_state,
+			registered: registered
 		},
+		registration: reg,
 		signal: {
 			percent: sig_quality,
 			csq: csq,

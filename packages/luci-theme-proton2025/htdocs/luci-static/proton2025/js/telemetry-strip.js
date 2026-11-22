@@ -84,11 +84,17 @@
 
 		if (elStairs) elStairs.setAttribute('data-bars', d.bars != null ? d.bars : 0);
 		if (elOp) elOp.textContent = d.operator || 'Searching';
-		if (elRat) elRat.textContent = d.band || d.rat || 'LTE';
-		if (elSig) elSig.textContent = (d.signal != null ? d.signal : 0) + '%';
+		var noSvc = (d.service === false);
+		if (elRat) {
+			elRat.textContent = (d.label != null) ? d.label : (d.band || d.rat || '—');
+			elRat.classList.toggle('telem-badge-nosvc', noSvc);
+		}
+		if (elSig) elSig.textContent = noSvc ? '' : (d.signal != null ? d.signal : 0) + '%';
 		if (elSigBox) {
-			if (d.band && d.rsrp) {
-				elSigBox.title = 'Band: ' + d.band + ' | EARFCN: ' + (d.earfcn || '') + ' | PCI: ' + (d.pci || '') + ' | RSRP: ' + d.rsrp + ' dBm | RSRQ: ' + (d.rsrq || '') + ' dB | RSSI: ' + (d.rssi || '') + ' dBm | SINR: ' + (d.snr || '') + ' dB';
+			if (noSvc) {
+				elSigBox.title = 'Cellular: no service' + (d.reg_state ? ' (registration: ' + d.reg_state + ')' : '');
+			} else if (d.rsrp) {
+				elSigBox.title = (d.label || '') + (d.band ? ' | EARFCN: ' + (d.earfcn || '') + ' | PCI: ' + (d.pci || '') : '') + ' | RSRP: ' + d.rsrp + ' dBm | RSRQ: ' + (d.rsrq || '') + ' dB | RSSI: ' + (d.rssi || '') + ' dBm | SINR: ' + (d.snr || '') + ' dB';
 			} else {
 				elSigBox.title = 'Cellular: ' + (d.operator || '') + ' (' + (d.state || '') + ')\nSignal: ' + (d.signal || 0) + '%';
 			}

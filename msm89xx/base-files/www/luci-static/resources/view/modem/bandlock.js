@@ -205,13 +205,13 @@ return view.extend({
 
 		// 1. Serving Cell & BTS Tower
 		var elBandBadge = document.getElementById('rf-band-badge');
-		if (elBandBadge) elBandBadge.textContent = s.band || 'LTE';
+		if (elBandBadge) elBandBadge.textContent = s.band || '--';
 
 		var elBandName = document.getElementById('rf-band-name');
-		if (elBandName) elBandName.textContent = s.band_name || '4G LTE';
+		if (elBandName) elBandName.textContent = s.band_name || _('No serving cell reported');
 
 		var elDuplex = document.getElementById('rf-duplex-badge');
-		if (elDuplex) elDuplex.textContent = s.duplex || 'LTE';
+		if (elDuplex) elDuplex.textContent = s.duplex || '--';
 
 		var elDl = document.getElementById('rf-freq-dl');
 		if (elDl) elDl.textContent = s.dl || '--';
@@ -222,8 +222,37 @@ return view.extend({
 		var elEarfcn = document.getElementById('rf-earfcn');
 		if (elEarfcn) elEarfcn.textContent = s.earfcn || '--';
 
+		var reg = data.registration || {};
 		var elOp = document.getElementById('rf-operator');
-		if (elOp) elOp.textContent = (op.name ? op.name + ' (' + (op.code || '51001') + ')' : 'Indosat Ooredoo (51001)');
+		if (elOp) {
+			if (op.registered)
+				elOp.textContent = (op.name || '--') + (op.code ? ' (' + op.code + ')' : '') + (op.reg_state === 'roaming' ? ' · ' + _('roaming') : '');
+			else
+				elOp.textContent = _('Not registered') + (reg.plmn ? ' · ' + _('camped on') + ' ' + reg.plmn : '');
+		}
+
+		// Registration banner: the readings on this page are radio measurements
+		// and exist even with no service, so say plainly when there is none.
+		var elReg = document.getElementById('rf-reg-banner');
+		if (elReg) {
+			if (op.registered) {
+				elReg.style.display = 'none';
+			} else {
+				var why = [];
+				if (reg.state) why.push(_('registration') + ': ' + reg.state);
+				else if (op.reg_state) why.push(_('registration') + ': ' + op.reg_state);
+				if (reg.plmn) why.push(_('camped on PLMN') + ' ' + reg.plmn);
+				if (reg.status) why.push(_('service') + ': ' + reg.status);
+				if (reg.forbidden) why.push(_('network forbidden for this SIM'));
+				dom.content(elReg, [
+					E('strong', {}, op.state === 'absent' ? _('No modem detected') : _('No service')),
+					' — ' + why.join(' · ') + '. ',
+					E('span', { 'style': 'opacity: 0.85;' }, op.state === 'absent' ? '' :
+						_('The cell and signal readings below are what the radio hears, not a working connection to your SIM\'s network.'))
+				]);
+				elReg.style.display = '';
+			}
+		}
 
 		var elEnb = document.getElementById('rf-enb-val');
 		if (elEnb) elEnb.textContent = s.enb || '--';
@@ -249,7 +278,10 @@ return view.extend({
 
 		// 3. Carrier Data Session
 		var elIp = document.getElementById('rf-ip-val');
-		if (elIp) elIp.textContent = b.ip || '--';
+		if (elIp) {
+			elIp.textContent = (b.ip || '--') + (b.stale ? ' (' + _('stale, no service') + ')' : '');
+			elIp.style.opacity = b.stale ? '0.55' : '';
+		}
 
 		var elGw = document.getElementById('rf-gw-val');
 		if (elGw) elGw.textContent = b.gateway || '--';
@@ -258,7 +290,7 @@ return view.extend({
 		if (elDns) elDns.textContent = (b.dns && b.dns.length) ? b.dns.join(', ') : '--';
 
 		var elApn = document.getElementById('rf-apn-val');
-		if (elApn) elApn.textContent = (b.apn || 'internet') + ' (MTU: ' + (b.mtu || '1500') + ')';
+		if (elApn) elApn.textContent = (b.apn || '--') + ' (MTU: ' + (b.mtu || '--') + ')';
 
 		var elUptime = document.getElementById('rf-uptime-val');
 		if (elUptime) elUptime.textContent = b.uptime || '00d 00h:00m:00s';
@@ -278,6 +310,9 @@ return view.extend({
 
 		var elFw = document.getElementById('rf-fw-val');
 		if (elFw) elFw.textContent = hw.revision || '--';
+
+		var elWd = document.getElementById('rf-watchdog-val');
+		if (elWd) elWd.textContent = hw.watchdog || '--';
 
 		// 5. Active Locked Band Status Badge
 		var elLockBadge = document.getElementById('rf-locked-status-badge');
@@ -326,7 +361,7 @@ return view.extend({
 			if (data.neighbors && data.neighbors.length > 0) {
 				data.neighbors.forEach(function(n) {
 					nbBody.appendChild(E('tr', {}, [
-						E('td', { 'style': 'font-weight: bold;' }, n.band || 'LTE'),
+						E('td', { 'style': 'font-weight: bold;' }, n.band || '--'),
 						E('td', { 'style': 'font-family: monospace;' }, n.earfcn || '--'),
 						E('td', { 'style': 'font-family: monospace;' }, n.pci || '--'),
 						E('td', { 'style': 'font-family: monospace; font-weight: 600;' }, n.rsrp ? n.rsrp + ' dBm' : '--'),
@@ -616,6 +651,12 @@ return view.extend({
 				])
 			]),
 
+			// 1b. Registration banner (hidden while registered)
+			E('div', {
+				'id': 'rf-reg-banner',
+				'style': 'display: none; margin-bottom: 14px; padding: 10px 14px; border-radius: 6px; font-size: 12px; line-height: 1.5; background: rgba(248,113,113,0.10); border: 1px solid rgba(248,113,113,0.35); color: #f87171;'
+			}),
+
 			// 2. Row 1: Serving Cell & BTS Tower (Left) & Compact 5-Gauge Signal Meter (Right)
 			E('div', {
 				'class': 'rf-cockpit-grid',
@@ -625,18 +666,18 @@ return view.extend({
 				E('div', { 'class': 'cbi-section rf-cockpit-card', 'style': 'margin: 0; padding: 14px 18px;' }, [
 					E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;' }, [
 						E('h3', { 'style': 'margin: 0; font-size: 14px;' }, _('Serving Cell & BTS Tower')),
-						E('span', { 'id': 'rf-duplex-badge', 'class': 'badge', 'style': 'font-size: 11px; font-weight: bold; padding: 2px 8px; border-radius: 4px; background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.3);' }, 'FDD')
+						E('span', { 'id': 'rf-duplex-badge', 'class': 'badge', 'style': 'font-size: 11px; font-weight: bold; padding: 2px 8px; border-radius: 4px; background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.3);' }, '--')
 					]),
 					// Hero Band Display
 					E('div', { 'style': 'display: flex; align-items: center; gap: 10px; margin: 4px 0 10px; padding: 8px 12px; background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.2); border-radius: 6px;' }, [
-						E('span', { 'id': 'rf-band-badge', 'style': 'font-size: 16px; font-weight: 800; font-family: monospace; color: #38bdf8;' }, 'B3'),
-						E('span', { 'id': 'rf-band-name', 'style': 'font-size: 12px; font-weight: 600;' }, 'Band 3 (1800 MHz DCS - FDD)')
+						E('span', { 'id': 'rf-band-badge', 'style': 'font-size: 16px; font-weight: 800; font-family: monospace; color: #38bdf8;' }, '--'),
+						E('span', { 'id': 'rf-band-name', 'style': 'font-size: 12px; font-weight: 600;' }, '--')
 					]),
 					E('div', { 'style': 'display: flex; flex-direction: column;' }, [
 						createInfoRow(_('Downlink (DL)'), 'rf-freq-dl', '--', true, '#34d399'),
 						createInfoRow(_('Uplink (UL)'), 'rf-freq-ul', '--', true),
 						createInfoRow(_('Channel (EARFCN)'), 'rf-earfcn', '--', true),
-						createInfoRow(_('Operator (PLMN)'), 'rf-operator', 'Indosat Ooredoo (51001)', false),
+						createInfoRow(_('Operator (PLMN)'), 'rf-operator', '--', false),
 						createInfoRow(_('Macro eNodeB ID'), 'rf-enb-val', '--', true, '#38bdf8'),
 						createInfoRow(_('Sector ID'), 'rf-sector-val', '--', true),
 						createInfoRow(_('Physical CI (PCI)'), 'rf-pci-val', '--', true, '#34d399'),
@@ -688,7 +729,7 @@ return view.extend({
 						createInfoRow(_('SIM IMSI'), 'rf-imsi-val', '--', true),
 						createInfoRow(_('SIM ICCID'), 'rf-iccid-val', '--', true),
 						createInfoRow(_('Baseband Firmware'), 'rf-fw-val', '--', true),
-						createInfoRow(_('Watchdog Engine'), 'rf-watchdog-val', 'Remoteproc SSR Protected (0 Failures)', false, '#34d399', true)
+						createInfoRow(_('Modem Watchdog'), 'rf-watchdog-val', '--', false, null, true)
 					])
 				])
 			]),
