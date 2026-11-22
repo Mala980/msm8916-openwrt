@@ -4,7 +4,8 @@
 		"read": {
 			"file": {
 				"/usr/bin/mmcli": [ "exec" ],
-				"/usr/sbin/modem-speedtest": [ "exec" ]
+				"/usr/sbin/modem-speedtest": [ "exec" ],
+				"/usr/bin/change-imei": [ "exec" ]
 			},
 			"ubus": {
 				"luci.proton-system": [
@@ -23,7 +24,8 @@
 		"write": {
 			"file": {
 				"/usr/bin/mmcli": [ "exec" ],
-				"/usr/sbin/modem-speedtest": [ "exec" ]
+				"/usr/sbin/modem-speedtest": [ "exec" ],
+				"/usr/bin/change-imei": [ "exec" ]
 			},
 			"ubus": {
 				"luci.proton-system": [
