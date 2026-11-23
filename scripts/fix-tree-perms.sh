@@ -42,7 +42,7 @@ fix_repo() { # fix_repo <dir> <find prune expression...>
     # untracked files come out as "?".
     local bad
     bad="$(mktemp)"
-    (cd "$repo" && find . "$@" -type f ! -perm -0004 -print) | sed 's#^\./##' > "$bad"
+    (cd "$repo" && find . -name .git -prune -o "$@" -type f ! -perm -0004 -print) | sed 's#^\./##' > "$bad"
     while IFS=$'\t' read -r m rel; do
         if [ "$m" = "?" ]; then
             case "$(head -c 4 "$repo/$rel" 2>/dev/null | od -An -c | tr -d ' ')" in
@@ -50,8 +50,9 @@ fix_repo() { # fix_repo <dir> <find prune expression...>
                 *) m=644 ;;
             esac
         fi
-        chmod "$m" "$repo/$rel"
-        changed=$((changed + 1))
+        # A single file that cannot be changed (e.g. a read-only object of a
+        # nested git checkout) must not stop the whole pass.
+        chmod "$m" "$repo/$rel" 2>/dev/null && changed=$((changed + 1)) || true
     done < <(awk -F'\t' 'FILENAME == ARGV[1] { mode[$2] = $1; next } { print (($0 in mode) ? mode[$0] : "?") "\t" $0 }' "$modes" "$bad")
     rm -f "$bad"
 
@@ -61,7 +62,7 @@ fix_repo() { # fix_repo <dir> <find prune expression...>
 if [ "$mode" = repo ]; then
     # The project checkout: everything except the OpenWrt tree inside it.
     fix_repo . \( -path ./.git -o -path ./openwrt \) -prune -o
-    find . \( -path ./.git -o -path ./openwrt \) -prune -o -type d ! -perm -0005 -exec chmod 755 {} +
+    find . \( -name .git -o -path ./openwrt \) -prune -o -type d ! -perm -0005 -exec chmod 755 {} + 2>/dev/null || true
     echo "$changed"
     exit 0
 fi
@@ -76,7 +77,7 @@ for feed in feeds/*/; do
     fix_repo "${feed%/}" -path ./.git -prune -o
 done
 
-find . \( -path ./build_dir -o -path ./staging_dir -o -path ./bin -o -path ./dl -o -path ./tmp \) -prune \
-    -o -type d ! -perm -0005 -exec chmod 755 {} +
+find . \( -name .git -o -path ./build_dir -o -path ./staging_dir -o -path ./bin -o -path ./dl -o -path ./tmp \) -prune \
+    -o -type d ! -perm -0005 -exec chmod 755 {} + 2>/dev/null || true
 
 echo "$changed"
