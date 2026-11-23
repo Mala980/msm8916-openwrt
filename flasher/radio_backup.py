@@ -94,12 +94,36 @@ def parse_sahara(text):
     return info
 
 
-def run_edl(edl, args):
-    """Run edl quietly, return (rc, text). Callers show edl_tail() on failure."""
-    proc = subprocess.run([edl] + args, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, universal_newlines=True,
-                          errors="replace")
-    return proc.returncode, proc.stdout
+PCT_RE = re.compile(r"(\d{1,3}\.\d+)%")
+SPEED_RE = re.compile(r"([\d.]+ [KMG]B/s)")
+DEBUG = os.environ.get("FLASH_DEBUG") == "1"
+
+
+def run_edl(edl, args, on_progress=None):
+    """Run edl, return (rc, text). Its output is read as it arrives so the
+    caller can show edl's own progress (on_progress(pct, speed)); with
+    FLASH_DEBUG=1 the raw output is also echoed. Callers show edl_tail() on
+    failure."""
+    proc = subprocess.Popen([edl] + args, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+    chunks = []
+    while True:
+        data = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
+        if not data:
+            break
+        text = data.decode("utf-8", "replace")
+        chunks.append(text)
+        if DEBUG:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+        elif on_progress:
+            frames = [f for f in text.replace("\r", "\n").split("\n") if "Progress:" in f]
+            if frames:
+                m, sp = PCT_RE.search(frames[-1]), SPEED_RE.search(frames[-1])
+                if m:
+                    on_progress(m.group(1) + "%", sp.group(1) if sp else "")
+    proc.wait()
+    return proc.returncode, "".join(chunks)
 
 
 def edl_tail(text, n=20):
@@ -113,6 +137,10 @@ def edl_tail(text, n=20):
 
 def progress(msg, done=False):
     """One self-updating line on a terminal, plain lines otherwise."""
+    if DEBUG:
+        if done:
+            log(msg)
+        return
     if sys.stderr.isatty():
         sys.stderr.write("\r\033[K[*] " + msg + ("\n" if done else ""))
         sys.stderr.flush()
@@ -223,8 +251,13 @@ def cmd_backup(a):
         started = time.time()
         for i, part in enumerate(parts):
             out = os.path.join(staging, part + ".bin")
-            progress("Backing up this unit's radio partitions… %s (%d/%d)" % (part, i + 1, len(parts)))
-            rc, text = run_edl(edl, ["r", part, out])
+            label = "Backing up this unit's radio partitions… %s (%d/%d)" % (part, i + 1, len(parts))
+            progress(label)
+            if DEBUG:
+                log(label)
+            rc, text = run_edl(edl, ["r", part, out],
+                               lambda pct, speed, label=label: progress(
+                                   "%s  %s%s" % (label, pct, ("  " + speed) if speed else "")))
             if i == 0:
                 identity = parse_sahara(text)
             if rc != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:

@@ -11,13 +11,22 @@
 # Reads images from ./firmware/. Run backup-stock.sh FIRST on a new dongle.
 # Any missing tool (edl, python, adb) is installed into ./temp automatically.
 #
-# Output: one line per step. edl's own output (banners, progress bars) is kept
-# off the screen and only shown -- its last lines -- when a step fails. No log
-# file is written.
+# Output: one line per step with edl's own progress (xx.xxx%, MB/s). edl's raw
+# output (banners, progress bars) stays off the screen and only its last lines
+# are shown when a step fails. No log file is written.
+#
+#   ./flash-firmware.sh            normal, tidy output
+#   ./flash-firmware.sh --debug    also show edl's raw output (FLASH_DEBUG=1)
 # ===========================================================================
+# The whole script is one { ... } block: bash parses all of it before running
+# anything, so editing this file while a flash is in progress cannot make the
+# running flash execute a mix of old and new lines.
+{
 set -euo pipefail
 cd "$(dirname "$0")"
 trap '' HUP
+case "${1:-}" in --debug|-d) FLASH_DEBUG=1 ;; esac
+FLASH_DEBUG="${FLASH_DEBUG:-0}"; export FLASH_DEBUG
 
 # ===== self-contained tooling — everything installs into ./temp (gitignored) =====
 TEMP_DIR="$PWD/temp"
@@ -28,18 +37,29 @@ die()  { printf '%s[-]%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
 hms()  { printf '%dh %02dm %02ds' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }   # seconds -> H M S
 PY=""; ADB=""; EDL="${EDL_BIN:-}"
 
-# Run one edl command as a single tidy step: "[*] <label> … 12s" with a spinner
-# on a terminal, then "✓" or, on failure, edl's last 20 lines. Returns edl's
-# exit status (callers decide whether it is fatal).
+# Run one edl command as a single tidy step:
+#   [*] Writing rootfs (17 MB)  45.123%  15.2 MB/s  12s     (live, on a terminal)
+#   [*] Writing rootfs (17 MB) ✓ 14s
+# On failure edl's last 20 meaningful lines are shown. With --debug edl's raw
+# output goes to the screen as well. Returns edl's exit status (callers decide
+# whether it is fatal).
 edl_step() {
     local label="$1"; shift
-    local out rc=0 start=$SECONDS pid spin='|/-\' i=0
+    local out rc=0 start=$SECONDS pid spin='|/-\' i=0 pct speed tailtxt
     out="$(mktemp)"
-    if [[ -t 1 ]]; then
+    if [[ "$FLASH_DEBUG" == 1 ]]; then
+        printf '%s[*]%s %s…\n' "$c_g" "$c_0" "$label"
+        "$EDL" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+    elif [[ -t 1 ]]; then
         "$EDL" "$@" >"$out" 2>&1 &
         pid=$!
         while kill -0 "$pid" 2>/dev/null; do
-            printf '\r%s[*]%s %s %s %ds ' "$c_g" "$c_0" "$label" "${spin:i++%4:1}" $((SECONDS - start))
+            # edl redraws "Progress: |###| 45.123% Write (...) 15.24 MB/s" with \r
+            tailtxt="$(tail -c 400 "$out" 2>/dev/null | tr '\r' '\n' | grep 'Progress:' | tail -n 1)" || true
+            pct="$(printf '%s' "$tailtxt" | grep -oE '[0-9]{1,3}\.[0-9]+%' | tail -n 1)" || true
+            speed="$(printf '%s' "$tailtxt" | grep -oE '[0-9.]+ [KMG]B/s' | tail -n 1)" || true
+            printf '\r\033[K%s[*]%s %s  %s  %s%s%ds' "$c_g" "$c_0" "$label" "${pct:-${spin:i++%4:1}}" \
+                "${speed:+$speed  }" "" $((SECONDS - start))
             sleep 0.2
         done
         wait "$pid" || rc=$?
@@ -381,3 +401,5 @@ edl_step "Rebooting the dongle" reset || warn "edl reset failed — power-cycle 
 echo
 log "Flash complete in $(hms $SECONDS). The dongle boots OpenWrt with default config."
 log "Access: http://192.168.8.1 over the USB gadget (DHCP hands out 192.168.8.x)."
+exit
+}
