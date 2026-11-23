@@ -344,6 +344,7 @@ if [[ $rc -eq 4 ]]; then
 fi
 [[ $rc -eq 0 ]] || die "radio backup failed — nothing has been written to the dongle"
 [[ -d "$LIVE" ]] || die "radio backup returned no folder — nothing has been written to the dongle"
+log "Radio backup saved to: $LIVE"
 
 SAVED=""
 if [[ "$RADIO_SRC" == "2" ]]; then
@@ -363,9 +364,10 @@ if [[ "$RADIO_SRC" == "2" ]]; then
         fi
     fi
     SAVED="$STOCK_DIR"
-    log "Will restore radio partitions from $STOCK_DIR"
+    log "Will restore radio partitions from: $SAVED"
 else
     SAVED="$LIVE"
+    log "Will restore radio partitions from live backup: $SAVED"
 fi
 
 GPTTMP="$(mktemp -d)"
@@ -382,8 +384,8 @@ edl_step "Writing hyp"                    w hyp    "$MBN/hyp.mbn"   || die "hyp 
 edl_step "Writing rpm"                    w rpm    "$MBN/rpm.mbn"   || die "rpm write failed"
 edl_step "Writing sbl1"                   w sbl1   "$MBN/sbl1.mbn"  || die "sbl1 write failed"
 edl_step "Writing tz"                     w tz     "$MBN/tz.mbn"    || die "tz write failed"
-edl_step "Writing boot ($(mb "$BOOT"))"     w boot   "$BOOT"          || die "boot write failed"
-edl_step "Writing rootfs ($(mb "$ROOTFS"))" w rootfs "$ROOTFS"        || die "rootfs write failed"
+edl_step "Writing boot ($(basename "$BOOT"), $(mb "$BOOT"))"     w boot   "$BOOT"          || die "boot write failed"
+edl_step "Writing rootfs ($(basename "$ROOTFS"), $(mb "$ROOTFS"))" w rootfs "$ROOTFS"        || die "rootfs write failed"
 ZEROS="$(mktemp)"
 dd if=/dev/zero of="$ZEROS" bs=1M count=32 status=none 2>/dev/null || dd if=/dev/zero of="$ZEROS" bs=512 count=65536 status=none 2>/dev/null || true
 edl_step "Clearing the settings overlay" ws 610338 "$ZEROS" || warn "clearing the overlay header returned non-zero"
