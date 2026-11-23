@@ -18,7 +18,9 @@
                     "getSpeedtestStatus",
                     "getSpeedtestHistory",
                     "cancelSpeedtest",
-                    "clearSpeedtestHistory"
+                    "clearSpeedtestHistory",
+                    "getOoklaStatus",
+                    "listOoklaServers"
                 ],
                 "luci.proton-search-cache": [
                     "loadCache"
@@ -64,7 +66,9 @@
             "ubus": {
                 "luci.proton-system": [
                     "setBandLock",
-                    "setNetworkSelection"
+                    "setNetworkSelection",
+                    "installOokla",
+                    "removeOokla"
                 ],
                 "luci.proton-temp": [
                     "setThresholds"

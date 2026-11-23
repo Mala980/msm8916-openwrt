@@ -33,35 +33,65 @@ var callClearHistory = rpc.declare({
 	expect: { '': {} }
 });
 
+var callOoklaStatus = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'getOoklaStatus',
+	expect: { '': {} }
+});
+
+var callInstallOokla = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'installOokla',
+	params: [ 'accept' ],
+	expect: { '': {} }
+});
+
+var callRemoveOokla = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'removeOokla',
+	expect: { '': {} }
+});
+
+var callListOoklaServers = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'listOoklaServers',
+	expect: { '': {} }
+});
+
+var callStartRouterSpeedtest = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'startSpeedtest',
+	params: [ 'gateway', 'size', 'custom_host' ],
+	expect: { '': {} }
+});
+
+var callGetSpeedtestStatus = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'getSpeedtestStatus',
+	expect: { '': {} }
+});
+
+var callCancelSpeedtest = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'cancelSpeedtest',
+	expect: { '': {} }
+});
+
+// Browser test targets. Each entry pings, downloads and uploads against the
+// same service, so the result really describes the server named here.
 var GATEWAYS = [
 	{
 		id: 'cloudflare',
-		name: 'Cloudflare Anycast (Jakarta / Singapore Edge CDN)',
-		location: 'Jakarta / SG Anycast',
+		name: 'Cloudflare (speed.cloudflare.com)',
+		location: 'Nearest Cloudflare edge',
 		pingUrl: 'https://speed.cloudflare.com/__down?bytes=0',
 		downUrl: 'https://speed.cloudflare.com/__down?bytes=',
 		upUrl: 'https://speed.cloudflare.com/__up'
 	},
 	{
-		id: 'google',
-		name: 'Google Edge Gateway (Jakarta CDN)',
-		location: 'Jakarta, ID',
-		pingUrl: 'https://www.google.com/generate_204',
-		downUrl: 'https://speed.cloudflare.com/__down?bytes=',
-		upUrl: 'https://speed.cloudflare.com/__up'
-	},
-	{
-		id: 'singapore',
-		name: 'Singapore International Hub (Singtel / Clouvider)',
-		location: 'Singapore, SG',
-		pingUrl: 'https://sg.speedtest.clouvider.net/backend/empty.php',
-		downUrl: 'https://sg.speedtest.clouvider.net/backend/garbage.php?ckSize=',
-		upUrl: 'https://speed.cloudflare.com/__up'
-	},
-	{
 		id: 'custom',
-		name: 'Custom Gateway (User Defined URL / Server)',
-		location: 'Custom Target',
+		name: 'Custom server (your own URLs)',
+		location: 'Custom target',
 		pingUrl: '',
 		downUrl: '',
 		upUrl: ''
@@ -165,8 +195,179 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			callGetSignal(),
-			callGetSpeedtestHistory()
+			callGetSpeedtestHistory(),
+			callOoklaStatus().catch(function() { return {}; })
 		]);
+	},
+
+	// ---- Speedtest by Ookla (runs on the router) ---------------------------
+	ooklaTimer: null,
+
+	renderOoklaCard: function(st) {
+		var self = this;
+		var body = document.getElementById('ookla-card-body');
+		if (!body) return;
+		st = st || {};
+
+		if (!st.installed) {
+			var accept = E('input', { 'type': 'checkbox', 'id': 'ookla-accept' });
+			var btn = E('button', {
+				'class': 'cbi-button cbi-button-apply',
+				'disabled': st.installing ? 'disabled' : null,
+				'click': function(ev) {
+					ev.preventDefault();
+					if (!accept.checked) {
+						ui.addNotification(null, E('p', _('Please accept the Speedtest CLI license first.')), 'warning');
+						return;
+					}
+					callInstallOokla(true).then(function() { self.pollOoklaInstall(); });
+				}
+			}, st.installing ? _('Installing...') : _('Download and install'));
+
+			dom.content(body, [
+				E('p', { 'style': 'margin: 0 0 8px; font-size: 12px;' },
+					_('The official Speedtest CLI measures from the router itself, with multiple connections, against a real Ookla server near you (often your operator\'s own), so results match the Speedtest app on a phone or computer. It is proprietary and free for personal, non-commercial use, so it is not included in the firmware: it is downloaded from Ookla (about 1 MB) and checked before it is installed. Once installed you can also run "speedtest" in an SSH shell.')),
+				E('label', { 'style': 'display: flex; gap: 8px; align-items: flex-start; font-size: 12px; margin-bottom: 10px;' }, [
+					accept,
+					E('span', {}, [
+						_('I accept the Speedtest by Ookla '),
+						E('a', { 'href': st.eula, 'target': '_blank', 'rel': 'noopener' }, _('EULA')), ', ',
+						E('a', { 'href': st.terms, 'target': '_blank', 'rel': 'noopener' }, _('Terms of Use')), _(' and '),
+						E('a', { 'href': st.privacy, 'target': '_blank', 'rel': 'noopener' }, _('Privacy Policy')), '.'
+					])
+				]),
+				E('div', { 'style': 'display: flex; align-items: center; gap: 10px;' }, [
+					btn,
+					st.error ? E('span', { 'style': 'color: #f87171; font-size: 12px;' }, _('Install failed: %s').format(st.error)) : ''
+				])
+			]);
+			return;
+		}
+
+		var serverSelect = E('select', { 'class': 'cbi-input-select', 'id': 'ookla-server', 'style': 'min-width: 260px;' }, [
+			E('option', { 'value': '' }, _('Nearest server (automatic)'))
+		]);
+		var loadServers = E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'click': function(ev) {
+				ev.preventDefault();
+				loadServers.disabled = true;
+				loadServers.textContent = _('Loading...');
+				callListOoklaServers().then(function(r) {
+					(r.servers || []).forEach(function(sv) {
+						serverSelect.appendChild(E('option', { 'value': String(sv.id) },
+							sv.name + ' — ' + sv.location + (sv.country ? ', ' + sv.country : '')));
+					});
+					loadServers.textContent = (r.servers && r.servers.length) ? _('Servers loaded') : (r.error || _('No servers found'));
+				}).catch(function() { loadServers.disabled = false; loadServers.textContent = _('Load server list'); });
+			}
+		}, _('Load server list'));
+
+		dom.content(body, [
+			E('div', { 'style': 'display: flex; flex-wrap: wrap; align-items: center; gap: 8px;' }, [
+				serverSelect,
+				loadServers,
+				E('button', { 'class': 'cbi-button cbi-button-apply', 'id': 'ookla-run', 'click': function(ev) { ev.preventDefault(); self.runOokla(serverSelect.value); } }, _('Run Speedtest by Ookla')),
+				E('button', { 'class': 'cbi-button cbi-button-reset', 'id': 'ookla-stop', 'style': 'display: none;', 'click': function(ev) {
+					ev.preventDefault();
+					callCancelSpeedtest().then(function() { self.stopOoklaPoll(); self.showOoklaStatus({ state: 'idle', step_label: _('Cancelled') }); });
+				} }, _('Stop'))
+			]),
+			E('div', { 'id': 'ookla-status', 'style': 'margin-top: 10px; font-size: 12px; color: var(--text-color-medium);' },
+				_('Speedtest CLI %s installed.').format(st.version || '')),
+			E('div', { 'style': 'width: 100%; height: 6px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; margin-top: 6px;' }, [
+				E('div', { 'id': 'ookla-progress', 'style': 'width: 0%; height: 100%; background: #38bdf8; transition: width 0.3s ease;' })
+			]),
+			E('div', { 'id': 'ookla-result', 'style': 'margin-top: 12px;' }),
+			E('div', { 'style': 'margin-top: 10px; font-size: 11px;' }, [
+				E('a', { 'href': '#', 'click': function(ev) {
+					ev.preventDefault();
+					if (!confirm(_('Remove the Speedtest CLI from the router?'))) return;
+					callRemoveOokla().then(function(r) { self.renderOoklaCard(r); });
+				} }, _('Remove Speedtest CLI'))
+			])
+		]);
+	},
+
+	pollOoklaInstall: function() {
+		var self = this;
+		callOoklaStatus().then(function(st) {
+			self.renderOoklaCard(st);
+			if (st.installing) setTimeout(function() { self.pollOoklaInstall(); }, 2000);
+		});
+	},
+
+	stopOoklaPoll: function() {
+		if (this.ooklaTimer) clearInterval(this.ooklaTimer);
+		this.ooklaTimer = null;
+		var run = document.getElementById('ookla-run'), stop = document.getElementById('ookla-stop');
+		if (run) run.disabled = false;
+		if (stop) stop.style.display = 'none';
+	},
+
+	showOoklaStatus: function(d) {
+		var self = this;
+		var st = document.getElementById('ookla-status');
+		var bar = document.getElementById('ookla-progress');
+		var res = document.getElementById('ookla-result');
+		if (st) st.textContent = d.state === 'failed' ? _('Failed: %s').format(d.error || d.step_label) : (d.step_label || '');
+		if (st) st.style.color = d.state === 'failed' ? '#f87171' : '';
+		if (bar) bar.style.width = (d.progress || 0) + '%';
+
+		if (d.download_mbps) self.updateDial('st-dl-dial', d.download_mbps, 100);
+		if (d.upload_mbps) self.updateDial('st-ul-dial', d.upload_mbps, 50);
+		var dv = document.getElementById('st-dl-val'), uv = document.getElementById('st-ul-val');
+		if (dv && d.download_mbps) dv.textContent = Number(d.download_mbps).toFixed(2);
+		if (uv && d.upload_mbps) uv.textContent = Number(d.upload_mbps).toFixed(2);
+
+		if (res && (d.state === 'completed' || d.state === 'running')) {
+			var cell = function(label, val, color) {
+				return E('div', { 'style': 'padding: 8px 10px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color-medium); border-radius: 6px;' }, [
+					E('div', { 'style': 'font-size: 10px; text-transform: uppercase; color: var(--text-color-medium);' }, label),
+					E('div', { 'style': 'font-size: 16px; font-weight: 800; font-family: monospace;' + (color ? ' color: ' + color + ';' : '') }, val)
+				]);
+			};
+			dom.content(res, [
+				E('div', { 'style': 'display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px;' }, [
+					cell(_('Download'), d.download_mbps ? d.download_mbps + ' Mbps' : '--', '#38bdf8'),
+					cell(_('Upload'), d.upload_mbps ? d.upload_mbps + ' Mbps' : '--', '#34d399'),
+					cell(_('Ping'), d.ping_avg ? d.ping_avg + ' ms' : '--'),
+					cell(_('Jitter'), d.jitter ? d.jitter + ' ms' : '--'),
+					cell(_('Packet loss'), d.state === 'completed' ? (d.packet_loss || 0) + '%' : '--')
+				]),
+				E('div', { 'style': 'margin-top: 8px; font-size: 12px; color: var(--text-color-medium);' }, [
+					d.server ? _('Server: %s').format(d.server + (d.location ? ' (' + d.location + ')' : '')) : '',
+					d.isp ? ' · ' + _('ISP: %s').format(d.isp) : '',
+					d.result_url ? [' · ', E('a', { 'href': d.result_url, 'target': '_blank', 'rel': 'noopener' }, _('View result on speedtest.net'))] : ''
+				])
+			]);
+		}
+	},
+
+	runOokla: function(serverId) {
+		var self = this;
+		var run = document.getElementById('ookla-run'), stop = document.getElementById('ookla-stop');
+		if (run) run.disabled = true;
+		if (stop) stop.style.display = '';
+		self.showOoklaStatus({ state: 'running', step_label: _('Starting...'), progress: 2 });
+
+		callStartRouterSpeedtest('ookla', 'standard', serverId || '').then(function() {
+			if (self.ooklaTimer) clearInterval(self.ooklaTimer);
+			self.ooklaTimer = setInterval(function() {
+				callGetSpeedtestStatus().then(function(d) {
+					if (!d || d.engine !== 'ookla') return;
+					self.showOoklaStatus(d);
+					if (d.state === 'completed' || d.state === 'failed') {
+						self.stopOoklaPoll();
+						if (d.state === 'completed') {
+							self.localHistory = [d].concat(self.localHistory || []).slice(0, 10);
+							try { localStorage.setItem('modem_speedtest_history', JSON.stringify(self.localHistory)); } catch(e) {}
+							self.renderHistoryTable(self.localHistory);
+						}
+					}
+				});
+			}, 1000);
+		});
 	},
 
 	updateDial: function(dialId, val, maxVal) {
@@ -314,10 +515,10 @@ return view.extend({
 			tbody.appendChild(E('tr', {}, [
 				E('td', { 'style': 'font-family: monospace; font-size: 11px;' }, row.timestamp || '--'),
 				E('td', { 'style': 'font-weight: 600;' }, [
-					E('div', {}, row.server || '--'),
+					E('div', {}, (row.engine === 'ookla' ? 'Ookla · ' : '') + (row.server || '--')),
 					E('div', { 'style': 'font-size: 10px; color: var(--text-color-medium);' }, row.location || row.target || '')
 				]),
-				E('td', { 'style': 'font-family: monospace; color: #38bdf8;' }, row.band || 'LTE'),
+				E('td', { 'style': 'font-family: monospace; color: #38bdf8;' }, row.band || '--'),
 				E('td', { 'style': 'font-family: monospace; font-weight: 600;' }, (row.ping_avg ? row.ping_avg + ' ms' : '--')),
 				E('td', { 'style': 'font-family: monospace;' }, (row.jitter ? row.jitter + ' ms' : '--')),
 				E('td', { 'style': 'font-family: monospace; color: ' + (row.packet_loss > 0 ? '#ef4444' : '#10b981') + ';' }, (row.packet_loss != null ? row.packet_loss + '%' : '0%')),
@@ -786,14 +987,23 @@ return view.extend({
 				])
 			]),
 
-			// 2. Gateway Selector & Action Card
+			// 2a. Speedtest by Ookla (router-side)
+			E('div', {
+				'class': 'cbi-section rf-cockpit-card',
+				'style': 'margin-bottom: 16px; padding: 16px 20px; border: 1px solid var(--border-color-medium); border-radius: 8px;'
+			}, [
+				E('h3', { 'style': 'margin: 0 0 8px; font-size: 14px; font-weight: bold;' }, _('Speedtest by Ookla (runs on the router)')),
+				E('div', { 'id': 'ookla-card-body' }, '--')
+			]),
+
+			// 2b. Browser test card (this device -> router -> internet)
 			E('div', {
 				'class': 'cbi-section rf-cockpit-card',
 				'style': 'margin-bottom: 16px; padding: 16px 20px; background: rgba(255,255,255,0.02); border: 1px solid var(--border-color-medium); border-radius: 8px;'
 			}, [
 				E('div', { 'style': 'display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 14px;' }, [
 					E('div', { 'style': 'flex: 1; min-width: 280px;' }, [
-						E('label', { 'style': 'display: block; font-weight: 700; font-size: 13px; margin-bottom: 6px;' }, _('Select Benchmark Gateway / Test Server:')),
+						E('label', { 'style': 'display: block; font-weight: 700; font-size: 13px; margin-bottom: 6px;' }, _('Browser test (this device → router → internet), server:')),
 						gwSelect,
 						customGwBox
 					]),
@@ -852,7 +1062,7 @@ return view.extend({
 				createMetricCard(_('Latency (Ping)'), 'st-ping-val', 'st-ping-sub', 'st-ping-badge', '--', 'Min: -- | Max: -- ms', '#38bdf8'),
 				createMetricCard(_('Jitter Variance'), 'st-jitter-val', 'st-jitter-sub', 'st-jitter-badge', '--', 'RFC 3550 Variance', '#a78bfa'),
 				createMetricCard(_('Packet Loss'), 'st-loss-val', 'st-loss-sub', 'st-loss-badge', '0%', '100% Packets Received', '#10b981'),
-				createMetricCard(_('Serving Radio & Tower'), 'st-radio-val', 'st-radio-sub', 'st-radio-badge', (initialSig && initialSig.serving ? initialSig.serving.band : 'LTE'), 'Cloudflare Anycast', '#f59e0b')
+				createMetricCard(_('Serving Radio & Tower'), 'st-radio-val', 'st-radio-sub', 'st-radio-badge', (initialSig && initialSig.serving && initialSig.serving.band) || '--', '--', '#f59e0b')
 			]),
 
 			// 5. Dual Full-Timeline Waveform Canvas (Both curves visible from start to finish!)
@@ -901,8 +1111,11 @@ return view.extend({
 			])
 		]);
 
+		var ooklaInitial = (loadData && loadData[2]) ? loadData[2] : {};
 		setTimeout(function() {
 			if (self.localHistory) self.renderHistoryTable(self.localHistory);
+			self.renderOoklaCard(ooklaInitial);
+			if (ooklaInitial.installing) self.pollOoklaInstall();
 		}, 80);
 
 		return viewRoot;

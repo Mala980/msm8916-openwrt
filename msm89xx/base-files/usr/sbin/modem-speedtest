@@ -1,6 +1,7 @@
 #!/bin/sh
-# Qualcomm Snapdragon 410 (MSM8916) LTE Speedtest & Latency Diagnostic Engine
-# Usage: modem-speedtest <gateway_id> [size: standard|fast|deep] [custom_host] [custom_down] [custom_up]
+# Router-side speedtest.
+# Usage: modem-speedtest ookla [size-ignored] [ookla_server_id]
+#        modem-speedtest cloudflare|custom [size: standard|fast|deep] [custom_host] [custom_down] [custom_up]
 
 GATEWAY_ID="${1:-cloudflare}"
 TEST_SIZE="${2:-standard}"
@@ -8,9 +9,12 @@ CUSTOM_HOST="$3"
 CUSTOM_DOWN_URL="$4"
 CUSTOM_UP_URL="$5"
 
-OUTPUT_FILE="/tmp/.speedtest_status.json"
-PID_FILE="/tmp/.speedtest.pid"
-HIST_FILE="/tmp/.speedtest_history.json"
+STATE_DIR="${SPEEDTEST_STATE_DIR:-/tmp}"
+SPEEDTEST_BIN="${SPEEDTEST_BIN:-/usr/bin/speedtest}"
+OUTPUT_FILE="$STATE_DIR/.speedtest_status.json"
+PID_FILE="$STATE_DIR/.speedtest.pid"
+HIST_FILE="$STATE_DIR/.speedtest_history.json"
+TELEMETRY_FILE="$STATE_DIR/.telemetry_cache.json"
 
 echo "$$" > "$PID_FILE"
 
@@ -26,62 +30,147 @@ elif [ "$TEST_SIZE" = "deep" ]; then
     UP_COUNT=400 # 400 * 64k = 26.2 MB (1:1 with 25MB Download)
 fi
 
-SERVER_NAME="Cloudflare Anycast (Jakarta/Singapore)"
+# Read current active radio band & cell info (empty when not known)
+ACTIVE_BAND=""
+ACTIVE_OPERATOR=""
+ACTIVE_RSRP=""
+ACTIVE_SINR=""
+if [ -s "$TELEMETRY_FILE" ]; then
+    eval "$(jsonfilter -i "$TELEMETRY_FILE" \
+        -e 'ACTIVE_BAND=@.label' -e 'ACTIVE_OPERATOR=@.operator' \
+        -e 'ACTIVE_RSRP=@.rsrp' -e 'ACTIVE_SINR=@.snr' 2>/dev/null)"
+fi
+
+append_history() {
+    ucode -e '
+    import { readfile, writefile } from "fs";
+    let h = json(readfile(ARGV[0]) || "[]") || [];
+    let e = json(readfile(ARGV[1]));
+    if (e && e.state == "completed") {
+        unshift(h, e);
+        if (length(h) > 10) h = slice(h, 0, 10);
+        writefile(ARGV[0], sprintf("%J\n", h));
+    }
+    ' "$HIST_FILE" "$OUTPUT_FILE" 2>/dev/null || true
+}
+
+# --- Ookla engine -------------------------------------------------------------
+# Runs the official Speedtest CLI (installed with ookla-speedtest-install) on
+# the router itself, multi-connection, against a real Ookla server: the nearest
+# one, or the server id given as the 3rd argument. Live progress comes from
+# its JSON-lines output.
+ookla_status() { # ookla_status <state> <step> <label> <progress>
+    ucode -e '
+    let a = ARGV;
+    let num = (v) => (v == null || v == "") ? 0 : +v;
+    let mbps = (bw) => (bw == null || bw == "") ? 0 : +sprintf("%.2f", (+bw) * 8 / 1000000);
+    let e = {
+        engine: "ookla", state: a[0], step: a[1], step_label: a[2], progress: +a[3],
+        server: a[4] || "Ookla server", location: a[5], target: a[6], isp: a[7],
+        band: a[8], operator: a[9], rsrp: a[10], sinr: a[11],
+        ping_avg: num(a[12]), ping_min: num(a[13]), ping_max: num(a[14]), jitter: num(a[15]),
+        packet_loss: num(a[16]),
+        download_mbps: mbps(a[17]), upload_mbps: mbps(a[18]),
+        result_url: a[19], error: a[20]
+    };
+    if (a[0] == "completed") e.timestamp = a[21];
+    print(sprintf("%J\n", e));
+    ' "$1" "$2" "$3" "$4" "$O_SERVER" "$O_LOCATION" "$O_HOST" "$O_ISP" \
+      "$ACTIVE_BAND" "$ACTIVE_OPERATOR" "$ACTIVE_RSRP" "$ACTIVE_SINR" \
+      "$O_PING" "$O_PING_LOW" "$O_PING_HIGH" "$O_JITTER" "$O_LOSS" \
+      "$O_DOWN_BW" "$O_UP_BW" "$O_URL" "$O_ERROR" "$(date '+%Y-%m-%d %H:%M:%S')" \
+      > "$OUTPUT_FILE.tmp" && mv -f "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+}
+
+run_ookla() {
+    local server_id="$1" line T P
+    O_SERVER=""; O_LOCATION=""; O_HOST=""; O_ISP=""; O_PING=""; O_PING_LOW=""; O_PING_HIGH=""
+    O_JITTER=""; O_LOSS=""; O_DOWN_BW=""; O_UP_BW=""; O_URL=""; O_ERROR=""
+
+    if [ ! -x "$SPEEDTEST_BIN" ]; then
+        O_ERROR="Speedtest CLI by Ookla is not installed (run ookla-speedtest-install --accept-license)"
+        ookla_status failed error "$O_ERROR" 100
+        rm -f "$PID_FILE"; exit 1
+    fi
+
+    ookla_status running start "Selecting the nearest Ookla server..." 5
+
+    case "$server_id" in ''|*[!0-9]*) server_id="" ;; esac
+
+    HOME=/root "$SPEEDTEST_BIN" --accept-license --accept-gdpr -f jsonl -p yes \
+        ${server_id:+-s "$server_id"} 2>/dev/null |
+    while IFS= read -r line; do
+        T=""; P=""
+        eval "$(jsonfilter -s "$line" -e 'T=@.type' 2>/dev/null)"
+        case "$T" in
+            testStart)
+                eval "$(jsonfilter -s "$line" -e 'O_SERVER=@.server.name' -e 'O_LOCATION=@.server.location' \
+                    -e 'O_HOST=@.server.host' -e 'O_ISP=@.isp' 2>/dev/null)"
+                ookla_status running ping "Measuring latency to $O_SERVER ($O_LOCATION)..." 10
+                ;;
+            ping)
+                eval "$(jsonfilter -s "$line" -e 'O_PING=@.ping.latency' -e 'O_JITTER=@.ping.jitter' -e 'P=@.ping.progress' 2>/dev/null)"
+                ookla_status running ping "Measuring latency to $O_SERVER..." "$(awk -v p="${P:-0}" 'BEGIN{printf "%d", 10 + p * 20}')"
+                ;;
+            download)
+                eval "$(jsonfilter -s "$line" -e 'O_DOWN_BW=@.download.bandwidth' -e 'P=@.download.progress' 2>/dev/null)"
+                ookla_status running download "Measuring download speed..." "$(awk -v p="${P:-0}" 'BEGIN{printf "%d", 30 + p * 35}')"
+                ;;
+            upload)
+                eval "$(jsonfilter -s "$line" -e 'O_UP_BW=@.upload.bandwidth' -e 'P=@.upload.progress' 2>/dev/null)"
+                ookla_status running upload "Measuring upload speed..." "$(awk -v p="${P:-0}" 'BEGIN{printf "%d", 65 + p * 34}')"
+                ;;
+            result)
+                eval "$(jsonfilter -s "$line" \
+                    -e 'O_PING=@.ping.latency' -e 'O_PING_LOW=@.ping.low' -e 'O_PING_HIGH=@.ping.high' \
+                    -e 'O_JITTER=@.ping.jitter' -e 'O_LOSS=@.packetLoss' \
+                    -e 'O_DOWN_BW=@.download.bandwidth' -e 'O_UP_BW=@.upload.bandwidth' \
+                    -e 'O_URL=@.result.url' -e 'O_SERVER=@.server.name' -e 'O_LOCATION=@.server.location' \
+                    -e 'O_ISP=@.isp' 2>/dev/null)"
+                ookla_status completed done "Speedtest by Ookla completed" 100
+                ;;
+            '')
+                # e.g. {"error":"Cannot read: "} when the servers are unreachable
+                eval "$(jsonfilter -s "$line" -e 'O_ERROR=@.error' 2>/dev/null)"
+                ;;
+            log|error)
+                eval "$(jsonfilter -s "$line" -e 'P=@.level' -e 'O_ERROR=@.message' -e 'O_ERROR=@.error' 2>/dev/null)"
+                [ "$T" = "error" ] || [ "$P" = "error" ] || O_ERROR=""
+                ;;
+        esac
+        [ -n "$O_ERROR" ] && echo "$O_ERROR" > "$OUTPUT_FILE.err"
+    done
+
+    # The pipeline ran in a subshell: decide the outcome from the status file.
+    if ! grep -q '"state": *"completed"' "$OUTPUT_FILE" 2>/dev/null; then
+        O_ERROR="$(cat "$OUTPUT_FILE.err" 2>/dev/null)"
+        [ -n "$O_ERROR" ] || O_ERROR="Speedtest by Ookla did not complete (no connection to the Ookla servers?)"
+        ookla_status failed error "$O_ERROR" 100
+    else
+        append_history
+    fi
+    rm -f "$OUTPUT_FILE.err" "$PID_FILE"
+    exit 0
+}
+
+[ "$GATEWAY_ID" = "ookla" ] && run_ookla "$CUSTOM_HOST"
+
+# --- Cloudflare engine (single HTTP stream) -----------------------------------
+# Older builds offered OpenIXP / Google / Singtel / Quad9 "servers" that all
+# downloaded from Cloudflare and only pinged elsewhere; they map to Cloudflare.
+SERVER_NAME="Cloudflare (speed.cloudflare.com)"
 PING_TARGET="1.1.1.1"
 DOWN_URL="https://speed.cloudflare.com/__down?bytes=$DOWN_BYTES"
 UP_URL="https://speed.cloudflare.com/__up"
-LOCATION="Jakarta Anycast"
+LOCATION="Nearest Cloudflare edge"
 
-case "$GATEWAY_ID" in
-    openixp)
-        SERVER_NAME="OpenIXP Domestic Exchange (Cyber Jakarta)"
-        PING_TARGET="103.10.60.1"
-        DOWN_URL="https://speed.cloudflare.com/__down?bytes=$DOWN_BYTES"
-        UP_URL="https://speed.cloudflare.com/__up"
-        LOCATION="Cyber Building (Jakarta, ID)"
-        ;;
-    google)
-        SERVER_NAME="Google Edge Gateway (Jakarta)"
-        PING_TARGET="8.8.8.8"
-        DOWN_URL="https://speed.cloudflare.com/__down?bytes=$DOWN_BYTES"
-        UP_URL="https://speed.cloudflare.com/__up"
-        LOCATION="Jakarta, ID"
-        ;;
-    singnet)
-        SERVER_NAME="Singtel International Gateway (Singapore)"
-        PING_TARGET="speedtest.singnet.com.sg"
-        DOWN_URL="https://speed.cloudflare.com/__down?bytes=$DOWN_BYTES"
-        UP_URL="https://speed.cloudflare.com/__up"
-        LOCATION="Singapore, SG"
-        ;;
-    quad9)
-        SERVER_NAME="Quad9 Global Anycast Gateway"
-        PING_TARGET="9.9.9.9"
-        DOWN_URL="https://speed.cloudflare.com/__down?bytes=$DOWN_BYTES"
-        UP_URL="https://speed.cloudflare.com/__up"
-        LOCATION="Global Anycast"
-        ;;
-    custom)
-        SERVER_NAME="Custom Gateway ($CUSTOM_HOST)"
-        [ -n "$CUSTOM_HOST" ] && PING_TARGET="$CUSTOM_HOST"
-        [ -n "$CUSTOM_DOWN_URL" ] && DOWN_URL="$CUSTOM_DOWN_URL"
-        [ -n "$CUSTOM_UP_URL" ] && UP_URL="$CUSTOM_UP_URL"
-        LOCATION="Custom Target"
-        ;;
-esac
-
-# Read current active radio band & cell info
-ACTIVE_BAND="LTE"
-ACTIVE_OPERATOR="Indosat"
-ACTIVE_RSRP="--"
-ACTIVE_SINR="--"
-if [ -f /tmp/.telemetry_cache.json ]; then
-    ACTIVE_BAND=$(grep -o '"band":"[^"]*"' /tmp/.telemetry_cache.json | cut -d'"' -f4)
-    ACTIVE_OPERATOR=$(grep -o '"operator":"[^"]*"' /tmp/.telemetry_cache.json | cut -d'"' -f4)
-    ACTIVE_RSRP=$(grep -o '"rsrp":"[^"]*"' /tmp/.telemetry_cache.json | cut -d'"' -f4)
-    ACTIVE_SINR=$(grep -o '"snr":"[^"]*"' /tmp/.telemetry_cache.json | cut -d'"' -f4)
+if [ "$GATEWAY_ID" = "custom" ]; then
+    SERVER_NAME="Custom server ($CUSTOM_HOST)"
+    [ -n "$CUSTOM_HOST" ] && PING_TARGET="$CUSTOM_HOST"
+    [ -n "$CUSTOM_DOWN_URL" ] && DOWN_URL="$CUSTOM_DOWN_URL"
+    [ -n "$CUSTOM_UP_URL" ] && UP_URL="$CUSTOM_UP_URL"
+    LOCATION="Custom target"
 fi
-[ -z "$ACTIVE_BAND" ] && ACTIVE_BAND="LTE"
 
 # Initialize Status
 cat << JSON > "$OUTPUT_FILE"
@@ -153,7 +242,7 @@ cat << JSON > "$OUTPUT_FILE"
 {
   "state": "running",
   "step": "download",
-  "step_label": "[Phase 2/3] Benchmarking 4G LTE Download Speed ($((DOWN_BYTES / 1000000)) MB)...",
+  "step_label": "[Phase 2/3] Measuring download speed ($((DOWN_BYTES / 1000000)) MB)...",
   "server": "$SERVER_NAME",
   "location": "$LOCATION",
   "target": "$PING_TARGET",
@@ -192,7 +281,7 @@ cat << JSON > "$OUTPUT_FILE"
 {
   "state": "running",
   "step": "upload",
-  "step_label": "[Phase 3/3] Benchmarking 4G LTE Upload Speed ($((UP_COUNT * 64 / 1024)) MB 1:1 Payload)...",
+  "step_label": "[Phase 3/3] Measuring upload speed ($((UP_COUNT * 64 / 1024)) MB 1:1 Payload)...",
   "server": "$SERVER_NAME",
   "location": "$LOCATION",
   "target": "$PING_TARGET",
@@ -262,14 +351,4 @@ JSON
 
 rm -f "$PID_FILE"
 
-# Append to history log
-ucode -e '
-import { readfile, writefile } from "fs";
-let h = json(readfile("/tmp/.speedtest_history.json") || "[]") || [];
-let e = json(readfile("/tmp/.speedtest_status.json"));
-if (e && e.state == "completed") {
-    unshift(h, e);
-    if (length(h) > 10) h = slice(h, 0, 10);
-    writefile("/tmp/.speedtest_history.json", sprintf("%J\n", h));
-}
-' 2>/dev/null || true
+append_history

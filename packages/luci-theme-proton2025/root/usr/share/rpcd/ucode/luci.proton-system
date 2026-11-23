@@ -954,6 +954,74 @@ function setBandLock(params) {
 	};
 }
 
+// Speedtest CLI by Ookla: downloaded on request by ookla-speedtest-install
+// (proprietary, personal use), installed as /usr/bin/speedtest.
+const OOKLA_INSTALL_LOG = "/tmp/.ookla_install.log";
+const OOKLA_INSTALL_RC = "/tmp/.ookla_install.rc";
+const OOKLA_SERVERS_CACHE = "/tmp/.ookla_servers.json";
+const OOKLA_SERVERS_TTL = 600;
+
+function getOoklaStatus() {
+	let p = popen("/usr/sbin/ookla-speedtest-install --status 2>/dev/null");
+	let st = json((p ? p.read("all") : "") || "{}") || {};
+	if (p) p.close();
+
+	let rc = readfile(OOKLA_INSTALL_RC);
+	let installing = (readfile(OOKLA_INSTALL_LOG) != null && rc == null);
+	let error = "";
+	if (rc != null && trim(rc) != "0") {
+		for (let l in split(readfile(OOKLA_INSTALL_LOG) || "", "\n"))
+			if (index(l, "error: ") == 0) error = substr(l, 7);
+		if (error == "") error = "installation failed";
+	}
+	return {
+		installed: !!st.installed,
+		version: st.version || "",
+		installing: installing,
+		error: error,
+		eula: "https://www.speedtest.net/about/eula",
+		terms: "https://www.speedtest.net/about/terms",
+		privacy: "https://www.speedtest.net/about/privacy"
+	};
+}
+
+function installOokla(params) {
+	if (!params || params.accept !== true)
+		return { started: false, error: "the Speedtest CLI license must be accepted" };
+	system(sprintf("rm -f %s %s; (/usr/sbin/ookla-speedtest-install --accept-license > %s 2>&1; echo $? > %s) >/dev/null 2>&1 &",
+		OOKLA_INSTALL_LOG, OOKLA_INSTALL_RC, OOKLA_INSTALL_LOG, OOKLA_INSTALL_RC));
+	return { started: true };
+}
+
+function removeOokla() {
+	system(sprintf("/usr/sbin/ookla-speedtest-install --remove >/dev/null 2>&1; rm -f %s %s %s",
+		OOKLA_INSTALL_LOG, OOKLA_INSTALL_RC, OOKLA_SERVERS_CACHE));
+	return getOoklaStatus();
+}
+
+// Nearby Ookla servers (the CLI picks the nearest by default), cached.
+function listOoklaServers() {
+	let cached = json(readfile(OOKLA_SERVERS_CACHE) || "null");
+	if (cached && cached.servers && length(cached.servers) && time() - int(cached.ts || 0) < OOKLA_SERVERS_TTL)
+		return { servers: cached.servers };
+
+	let p = popen("HOME=/root /usr/bin/speedtest --accept-license --accept-gdpr -L -f json 2>/dev/null");
+	let raw = p ? p.read("all") : "";
+	if (p) p.close();
+
+	let out = [];
+	for (let l in split(raw || "", "\n")) {
+		let j = json(trim(l) || "null");
+		if (j && type(j.servers) == "array") {
+			for (let sv in j.servers)
+				push(out, { id: sv.id, name: sv.name, location: sv.location, country: sv.country });
+		}
+	}
+	if (length(out))
+		writefile(OOKLA_SERVERS_CACHE, sprintf("%J\n", { ts: time(), servers: out }));
+	return { servers: out, error: length(out) ? "" : "could not reach the Ookla server list" };
+}
+
 function startSpeedtest(params) {
 	let gw = params ? (params.gateway || "cloudflare") : "cloudflare";
 	let sz = params ? (params.size || "standard") : "standard";
@@ -965,7 +1033,7 @@ function startSpeedtest(params) {
 	let pid_raw = readfile("/tmp/.speedtest.pid");
 	if (pid_raw) {
 		let old_pid = trim(pid_raw);
-		let kp = popen(sprintf("kill -9 %s 2>/dev/null", old_pid));
+		let kp = popen(sprintf("kill -9 %s 2>/dev/null; killall speedtest 2>/dev/null", old_pid));
 		if (kp) kp.close();
 	}
 
@@ -1018,7 +1086,7 @@ function cancelSpeedtest() {
 		let pid = trim(pid_raw);
 		let kp = popen(sprintf("kill -9 %s 2>/dev/null", pid));
 		if (kp) kp.close();
-		let pkill = popen("killall uclient-fetch ping 2>/dev/null");
+		let pkill = popen("killall uclient-fetch ping speedtest 2>/dev/null");
 		if (pkill) pkill.close();
 	}
 	writefile("/tmp/.speedtest_status.json", '{"state":"idle","step":"cancelled","progress":0}\n');
@@ -1067,6 +1135,27 @@ const methods = {
 		args: { mode: "string", plmn: "string" },
 		call: function(req) {
 			return setNetworkSelection(req.args);
+		}
+	},
+	getOoklaStatus: {
+		call: function() {
+			return getOoklaStatus();
+		}
+	},
+	installOokla: {
+		args: { accept: true },
+		call: function(req) {
+			return installOokla(req.args);
+		}
+	},
+	removeOokla: {
+		call: function() {
+			return removeOokla();
+		}
+	},
+	listOoklaServers: {
+		call: function() {
+			return listOoklaServers();
 		}
 	},
 	startSpeedtest: {

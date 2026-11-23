@@ -18,7 +18,9 @@
 					"getSpeedtestStatus",
 					"getSpeedtestHistory",
 					"cancelSpeedtest",
-					"clearSpeedtestHistory"
+					"clearSpeedtestHistory",
+					"getOoklaStatus",
+					"listOoklaServers"
 				]
 			}
 		},
@@ -34,7 +36,9 @@
 					"setNetworkSelection",
 					"startSpeedtest",
 					"cancelSpeedtest",
-					"clearSpeedtestHistory"
+					"clearSpeedtestHistory",
+					"installOokla",
+					"removeOokla"
 				]
 			}
 		}

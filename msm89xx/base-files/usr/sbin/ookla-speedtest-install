@@ -1,0 +1,103 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Install the official Speedtest CLI by Ookla on this router.
+#
+#   ookla-speedtest-install --accept-license   download, verify and install
+#   ookla-speedtest-install --remove           uninstall
+#   ookla-speedtest-install --status           print installed version (JSON)
+#
+# The Speedtest CLI is proprietary and licensed for personal, non-commercial
+# use only, so it is not shipped in the firmware: it is downloaded from Ookla
+# on request, after the user accepts the license, and checked against a pinned
+# SHA-256 before it is installed. Once installed, run `speedtest` in a shell or
+# use Modem > Speedtest in LuCI. The binary and the license acceptance are kept
+# across sysupgrade (/lib/upgrade/keep.d/ookla-speedtest).
+#
+#   EULA:    https://www.speedtest.net/about/eula
+#   Terms:   https://www.speedtest.net/about/terms
+#   Privacy: https://www.speedtest.net/about/privacy
+
+VERSION="1.2.0"
+BIN="/usr/bin/speedtest"
+CONF_HOME="/root"
+BASE_URL="${OOKLA_BASE_URL:-https://install.speedtest.net/app/cli}"
+
+# Pinned archive checksums of the official ${VERSION} builds.
+sha256_for() {
+	case "$1" in
+		aarch64) echo "3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3" ;;
+		*) echo "" ;;
+	esac
+}
+
+log() { echo "$*"; logger -t ookla-speedtest-install "$*" 2>/dev/null; }
+die() { echo "error: $*" >&2; logger -t ookla-speedtest-install "error: $*" 2>/dev/null; exit 1; }
+
+status() {
+	local ver=""
+	[ -x "$BIN" ] && ver="$("$BIN" --version 2>/dev/null | sed -n 's/^Speedtest by Ookla \([0-9.]*\).*/\1/p' | head -n1)"
+	if [ -n "$ver" ]; then
+		printf '{"installed":true,"version":"%s","path":"%s"}\n' "$ver" "$BIN"
+	else
+		printf '{"installed":false,"version":"","path":"%s"}\n' "$BIN"
+	fi
+}
+
+remove() {
+	rm -f "$BIN"
+	rm -rf "$CONF_HOME/.config/ookla"
+	log "Speedtest CLI removed"
+}
+
+install() {
+	local arch sum tmp url
+
+	arch="$(uname -m)"
+	sum="$(sha256_for "$arch")"
+	[ -n "$sum" ] || die "no pinned Speedtest CLI build for architecture '$arch'"
+
+	url="$BASE_URL/ookla-speedtest-$VERSION-linux-$arch.tgz"
+	tmp="$(mktemp -d /tmp/ookla.XXXXXX)" || die "cannot create a temporary directory"
+	trap 'rm -rf "$tmp"' EXIT
+
+	log "Downloading $url"
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -q -T 60 -O "$tmp/cli.tgz" "$url" || die "download failed (is the internet connection up?)"
+	else
+		wget -q -O "$tmp/cli.tgz" "$url" || die "download failed (is the internet connection up?)"
+	fi
+
+	[ "$(sha256sum "$tmp/cli.tgz" | cut -d' ' -f1)" = "$sum" ] || die "checksum mismatch, refusing to install"
+
+	tar -xzf "$tmp/cli.tgz" -C "$tmp" speedtest || die "archive does not contain the speedtest binary"
+	"$tmp/speedtest" --version >/dev/null 2>&1 || die "downloaded binary does not run on this system"
+
+	mv -f "$tmp/speedtest" "$BIN" && chmod 0755 "$BIN" || die "cannot install $BIN"
+
+	# Record the license/GDPR acceptance once so `speedtest` runs in a shell
+	# without prompting. --servers only fetches the server list.
+	HOME="$CONF_HOME" "$BIN" --accept-license --accept-gdpr --servers >/dev/null 2>&1 ||
+		log "license accepted; server list not reachable right now"
+
+	log "Speedtest CLI $VERSION installed at $BIN"
+}
+
+case "$1" in
+	--accept-license) install; status ;;
+	--remove) remove; status ;;
+	--status) status ;;
+	*)
+		cat <<EOF
+Usage: $0 --accept-license | --remove | --status
+
+Installs the official Speedtest CLI by Ookla ($VERSION) at $BIN.
+It is licensed for personal, non-commercial use only. By passing
+--accept-license you accept Ookla's EULA, Terms of Use and Privacy Policy:
+  https://www.speedtest.net/about/eula
+  https://www.speedtest.net/about/terms
+  https://www.speedtest.net/about/privacy
+EOF
+		exit 2
+		;;
+esac
