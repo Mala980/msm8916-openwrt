@@ -51,6 +51,13 @@ def _adb_shell(adb: str, command: str) -> str:
     return res.stdout if res.returncode == 0 else ""
 
 
+def _mac(text: str) -> str:
+    """A MAC address or "": Android 4.4's adb shell exits 0 and prints errors
+    (e.g. no wlan0 while Wi-Fi is off) on stdout."""
+    m = re.search(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", text or "")
+    return m.group(1).lower() if m else ""
+
+
 def read_stock_identity(adb: str) -> dict:
     """Identity of a stock dongle on ADB; fields that cannot be read are ""."""
     def prop(name: str) -> str:
@@ -60,7 +67,7 @@ def read_stock_identity(adb: str) -> dict:
         "model": prop("ro.product.model"),
         "version": prop("ro.build.display.id"),
         "imei": parse_iphonesubinfo(_adb_shell(adb, "service call iphonesubinfo 1")),
-        "wifi_mac": _adb_shell(adb, "cat /sys/class/net/wlan0/address").strip(),
+        "wifi_mac": _mac(_adb_shell(adb, "cat /sys/class/net/wlan0/address")),
         "android_serial": prop("ro.serialno"),
         "baseband": prop("gsm.version.baseband"),
     }

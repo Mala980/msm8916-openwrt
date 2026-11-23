@@ -103,6 +103,11 @@ class IdentityTest(unittest.TestCase):
             "wifi_mac": "a0:7c:48:ed:90:8d", "android_serial": "c7aa55ec",
             "baseband": "N958St_Z85"})
 
+    def test_identity_error_text_is_not_a_value(self):
+        # Android 4.4's adb shell exits 0 and prints the error on stdout.
+        os.environ["FAKE_MAC"] = "/system/bin/sh: cat: /sys/class/net/wlan0/address: No such file or directory"
+        self.assertEqual(convert.read_stock_identity(self.adb)["wifi_mac"], "")
+
     def test_identity_missing_fields(self):
         os.environ["FAKE_VERSION"] = ""
         os.environ["FAKE_PARCEL"] = "Result: Parcel(00000000 ffffffff)"
