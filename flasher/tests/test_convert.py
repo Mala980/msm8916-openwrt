@@ -126,8 +126,9 @@ class FakeWorld:
     """Scripted dongle + tools for convert_one/convert_loop."""
 
     def __init__(self, root: Path, golden=True, flash_rc=0, verify=None, ident=None,
-                 units=1, linger_polls=0):
+                 units=1, linger_polls=0, unit_modem=True):
         self.root = root
+        self.unit_modem = unit_modem     # False: a backup taken before modem was included
         self.calls = []
         self.flash_rc = flash_rc
         self.verify = verify or {"imei": IDENT["imei"], "wifi_up": True, "modem_present": True}
@@ -178,6 +179,8 @@ class FakeWorld:
         dest.mkdir(parents=True, exist_ok=True)
         for p in UNIQUE:
             (dest / (p + ".bin")).write_bytes(p.encode())
+        if self.unit_modem:
+            (dest / "modem.bin").write_bytes(b"modem")
         return 0, str(dest) + "\n"
 
     def verify_openwrt(self, imei):
@@ -198,7 +201,7 @@ class FakeWorld:
             backup_root=self.root, firmware_dir=Path("/flasher/firmware/openwrt-stable"),
             adb_devices=self.adb_devices, openwrt_online=self.openwrt_online,
             read_identity=self.read_identity, run=self.run, run_capture=self.run_capture,
-            verify_openwrt=self.verify_openwrt, sleep=self.sleep, out=lambda *a: None, **kw)
+            verify_openwrt=self.verify_openwrt, sleep=self.sleep, **dict({"out": lambda *a: None}, **kw))
 
     def kinds(self):
         out = []
@@ -237,14 +240,35 @@ class ConvertTest(unittest.TestCase):
         radio = Path(cmd[cmd.index("--radio-from") + 1])
         self.assertEqual(sorted(p.name for p in radio.iterdir()),
                          sorted(p + ".bin" for p in ["fsc", "fsg", "modemst1", "modemst2", "modem", "persist", "sec"]))
-        self.assertEqual((radio / "modem.bin").resolve(),
-                         (self.root / "stock-20261123-122955" / "modem.bin").resolve())
+        self.assertEqual((radio / "modem.bin").resolve().parent.name, "20261123-130500",
+                         "the unit's own modem.bin is flashed")
         self.assertEqual((radio / "modemst1.bin").resolve().parent.name, "20261123-130500")
         backup_cmd = [c[1] for c in w.calls if c[0] == "capture"][0]
-        self.assertIn("unique", backup_cmd)
+        self.assertEqual(backup_cmd[backup_cmd.index("--parts") + 1], "unit")
         self.assertIn("--identity", backup_cmd)
         self.assertIn("860018046041589", r.verdict)
         self.assertIn("Wi-Fi up", r.verdict)
+
+    def test_backup_without_modem_falls_back_to_golden_modem(self):
+        w = FakeWorld(self.root, unit_modem=False)
+        r = convert.convert_one(w.env())
+        self.assertTrue(r.ok, r.verdict)
+        cmd = self.flash_cmd(w)
+        radio = Path(cmd[cmd.index("--radio-from") + 1])
+        self.assertEqual((radio / "modem.bin").resolve(),
+                         (self.root / "stock-20261123-122955" / "modem.bin").resolve())
+
+    def test_reports_whether_unit_modem_matches_golden(self):
+        lines = []
+        w = FakeWorld(self.root)
+        convert.convert_one(w.env(out=lambda *a: lines.append(" ".join(map(str, a)))))
+        self.assertTrue(any("modem.bin matches the golden dump" in l for l in lines), lines)
+        lines.clear()
+        other = self.root / "other"
+        w = FakeWorld(other)
+        (other / "stock-20261123-122955" / "modem.bin").write_bytes(b"other-modem")
+        convert.convert_one(w.env(out=lambda *a: lines.append(" ".join(map(str, a)))))
+        self.assertTrue(any("differs from the golden dump" in l for l in lines), lines)
 
     def test_full_dump_when_no_golden(self):
         w = FakeWorld(self.root, golden=False)
@@ -278,6 +302,22 @@ class ConvertTest(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertIn("IMEI not verified", r.verdict)
 
+    def test_retries_identity_when_android_still_booting(self):
+        w = FakeWorld(self.root)
+        calls = [0]
+
+        def flaky_identity():
+            calls[0] += 1
+            w.calls.append(("identity",))
+            if calls[0] < 3:
+                return dict(IDENT, imei="")
+            return dict(IDENT)
+
+        w.read_identity = flaky_identity
+        r = convert.convert_one(w.env())
+        self.assertTrue(r.ok, r.verdict)
+        self.assertEqual(calls[0], 3)
+
     def test_stops_on_flash_failure(self):
         w = FakeWorld(self.root, units=2, flash_rc=1)
         rc = convert.convert_loop(w.env(max_units=2))
@@ -296,6 +336,9 @@ class RealEnvParsingTest(unittest.TestCase):
                          {"imei": "860018046041589", "wifi_up": True, "modem_present": True})
         self.assertEqual(convert.parse_verify("IMEI=\nWIFI=0\nMODEM=\n"),
                          {"imei": "", "wifi_up": False, "modem_present": False})
+
+    def test_ssh_opts_allow_blank_password(self):
+        self.assertNotIn("BatchMode=yes", convert.SSH_OPTS)
 
 
 class CombinedRestoreTest(unittest.TestCase):
@@ -322,6 +365,11 @@ class CombinedRestoreTest(unittest.TestCase):
         self.assertEqual((d / "system.bin").read_bytes(), b"sys")
         self.assertEqual((d / "modem.bin").read_bytes(), b"golden-modem")
         self.assertTrue((d / "restore_sectors.txt").is_file())
+
+    def test_combined_restore_uses_unit_modem_when_backed_up(self):
+        (self.unit / "modem.bin").write_bytes(b"unit-modem")
+        d = convert.assemble_stock_restore(self.unit, self.root, self.out)
+        self.assertEqual((d / "modem.bin").read_bytes(), b"unit-modem")
 
     def test_combined_restore_without_golden_refuses(self):
         (self.unit / "identity.json").write_text('{"version": "V9.9"}')

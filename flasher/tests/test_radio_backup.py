@@ -92,6 +92,15 @@ class RadioBackupTest(unittest.TestCase):
         self.assertEqual(bins, sorted(p + ".bin" for p in
                                       ["fsc", "fsg", "modemst1", "modemst2", "persist", "sec", "DDR", "ssd"]))
 
+    def test_parts_unit_alias_adds_modem(self):
+        r = self.backup("--parts", "unit")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dest = r.stdout.strip()
+        bins = sorted(f for f in os.listdir(dest) if f.endswith(".bin"))
+        self.assertEqual(bins, sorted(p + ".bin" for p in
+                                      ["fsc", "fsg", "modemst1", "modemst2", "persist", "sec", "DDR", "ssd",
+                                       "modem"]))
+
     def test_identity_json_saved(self):
         ident = os.path.join(self.tmp.name, "ident.json")
         with open(ident, "w") as f:

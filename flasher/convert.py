@@ -1,6 +1,6 @@
 """Convert stock UZ801 dongles to OpenWrt, one after another.
 
-Per unit only what is unique to it is backed up (see radio_backup.UNIQUE_PARTS);
+Per unit only what is unique to it, plus its own modem.bin, is backed up (see radio_backup.UNIT_PARTS);
 everything else comes from one "golden" full stock dump per stock firmware
 version. Design: docs/superpowers/specs/2026-11-23-flasher-convert-design.md
 """
@@ -42,9 +42,10 @@ def parse_iphonesubinfo(text: str) -> str:
     return digits if len(digits) == 15 else ""
 
 
-def _adb_shell(adb: str, command: str) -> str:
+def _adb_shell(adb: str, command: str, serial: str = "") -> str:
+    cmd = [adb] + (["-s", serial] if serial else []) + ["shell", command]
     try:
-        res = subprocess.run([adb, "shell", command], stdout=subprocess.PIPE,
+        res = subprocess.run(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, universal_newlines=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -58,16 +59,16 @@ def _mac(text: str) -> str:
     return m.group(1).lower() if m else ""
 
 
-def read_stock_identity(adb: str) -> dict:
+def read_stock_identity(adb: str, serial: str = "") -> dict:
     """Identity of a stock dongle on ADB; fields that cannot be read are ""."""
     def prop(name: str) -> str:
-        return _adb_shell(adb, "getprop " + name).strip()
+        return _adb_shell(adb, "getprop " + name, serial=serial).strip()
 
     return {
         "model": prop("ro.product.model"),
         "version": prop("ro.build.display.id"),
-        "imei": parse_iphonesubinfo(_adb_shell(adb, "service call iphonesubinfo 1")),
-        "wifi_mac": _mac(_adb_shell(adb, "cat /sys/class/net/wlan0/address")),
+        "imei": parse_iphonesubinfo(_adb_shell(adb, "service call iphonesubinfo 1", serial=serial)),
+        "wifi_mac": _mac(_adb_shell(adb, "cat /sys/class/net/wlan0/address", serial=serial)),
         "android_serial": prop("ro.serialno"),
         "baseband": prop("gsm.version.baseband"),
     }
@@ -134,13 +135,28 @@ def _wait_for_stock_dongle(env: ConvertEnv) -> Optional[UnitResult]:
 
 
 def _radio_set(unit_dir: Path, golden: Path) -> Path:
-    """Folder with the 7 partitions an OpenWrt flash writes as radio data:
-    the unit's own files plus the golden dump's (generic) modem.bin."""
+    """Folder with the 7 partitions an OpenWrt flash writes as radio data, all
+    from the unit's own backup. Only a backup taken before modem was included
+    falls back to the golden dump's modem.bin."""
     out = Path(tempfile.mkdtemp(prefix="convert-radio-"))
     for p in FLASH_RADIO_PARTS:
-        src = (golden if p == "modem" else unit_dir) / (p + ".bin")
+        src = unit_dir / (p + ".bin")
+        if p == "modem" and not src.is_file():
+            src = golden / "modem.bin"
         os.symlink(str(src.resolve()), str(out / (p + ".bin")))
     return out
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    if not (a.is_file() and b.is_file()) or a.stat().st_size != b.stat().st_size:
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(1 << 20), fb.read(1 << 20)
+            if x != y:
+                return False
+            if not x:
+                return True
 
 
 def convert_one(env: ConvertEnv) -> UnitResult:
@@ -149,6 +165,11 @@ def convert_one(env: ConvertEnv) -> UnitResult:
         return refused
 
     ident = env.read_identity()
+    for _ in range(4):
+        if ident.get("imei") and ident.get("version"):
+            break
+        env.sleep(2)
+        ident = env.read_identity()
     version, imei = ident.get("version", ""), ident.get("imei", "")
     env.out("[*] Stock dongle: %s %s, IMEI %s" % (ident.get("model", "?"), version or "(unknown version)",
                                                   imei or "(unreadable)"))
@@ -169,14 +190,16 @@ def convert_one(env: ConvertEnv) -> UnitResult:
         if refused:
             return refused
 
-    env.run([env.adb, "reboot", "edl"])
+    adb_devs = env.adb_devices()
+    adb_cmd = [env.adb] + (["-s", adb_devs[0]] if adb_devs else []) + ["reboot", "edl"]
+    env.run(adb_cmd)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(ident, f, indent=2, sort_keys=True)
         ident_file = f.name
     rc, outp = env.run_capture([env.python, "-I", str(env.flasher_dir / "radio_backup.py"),
                                 "--root", str(Path(env.backup_root) / "units"), "backup",
-                                "--edl", env.edl, "--parts", "unique", "--identity", ident_file,
+                                "--edl", env.edl, "--parts", "unit", "--identity", ident_file,
                                 "--print-path"])
     os.unlink(ident_file)
     lines = [l for l in outp.splitlines() if l.strip()]
@@ -185,6 +208,12 @@ def convert_one(env: ConvertEnv) -> UnitResult:
         return _fail("unique-partition backup failed (radio_backup exit %d) — nothing was written" % rc,
                      imei=imei)
     env.out("[*] Unit backup: %s" % unit_dir)
+    unit_modem = Path(unit_dir) / "modem.bin"
+    if unit_modem.is_file():
+        if _same_file(unit_modem, Path(golden) / "modem.bin"):
+            env.out("[*] modem.bin matches the golden dump")
+        else:
+            env.out("[!] modem.bin differs from the golden dump — flashing this unit's own copy")
 
     radio = _radio_set(Path(unit_dir), golden)
     rc = env.run(["bash", str(env.flasher_dir / "flash-firmware.sh"), "--firmware", str(env.firmware_dir),
@@ -242,8 +271,10 @@ def convert_loop(env: ConvertEnv) -> int:
 # Real environment (adb, edl, ssh on this computer)
 
 OPENWRT_HOST = "192.168.8.1"
+# Note: do NOT set BatchMode=yes — stock OpenWrt builds use a blank root password,
+# which BatchMode disables on OpenSSH clients.
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "LogLevel=ERROR"]
+            "-o", "ConnectTimeout=6", "-o", "LogLevel=ERROR"]
 
 # One ssh call; prints KEY=value lines for parse_verify().
 VERIFY_SCRIPT = (
@@ -302,24 +333,31 @@ def real_env(flasher_dir: Path, adb: str, edl: str) -> ConvertEnv:
     def verify_openwrt(_imei: str) -> dict:
         try:
             res = subprocess.run(["ssh"] + SSH_OPTS + ["root@" + OPENWRT_HOST, VERIFY_SCRIPT],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  universal_newlines=True, timeout=240)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print("[!] SSH verify failed: %s" % exc)
             return parse_verify("")
+        if res.returncode != 0 and res.stderr.strip():
+            print("[!] SSH verify error (rc=%d): %s" % (res.returncode, res.stderr.strip()))
         return parse_verify(res.stdout)
+
+    def read_identity() -> dict:
+        devs = adb_devices()
+        return read_stock_identity(adb, serial=devs[0] if devs else "")
 
     return ConvertEnv(
         adb=adb, edl=edl, python=sys.executable, flasher_dir=Path(flasher_dir),
         backup_root=Path(flasher_dir) / "backup", firmware_dir=Path(flasher_dir) / "firmware" / "openwrt-stable",
         adb_devices=adb_devices, openwrt_online=openwrt_online,
-        read_identity=lambda: read_stock_identity(adb), run=run, run_capture=run_capture,
+        read_identity=read_identity, run=run, run_capture=run_capture,
         verify_openwrt=verify_openwrt, sleep=time.sleep)
 
 
 # ---------------------------------------------------------------------------
 # Restore to stock from a golden dump + a unit's unique partitions
 
-from radio_backup import UNIQUE_PARTS  # noqa: E402  (single source of truth)
+from radio_backup import UNIT_PARTS  # noqa: E402  (single source of truth)
 
 
 def assemble_stock_restore(unit_backup: Path, backup_root: Path, out_dir: Path) -> Path:
@@ -340,7 +378,7 @@ def assemble_stock_restore(unit_backup: Path, backup_root: Path, out_dir: Path) 
     for f in golden.iterdir():
         if f.is_file():
             os.symlink(str(f.resolve()), str(out_dir / f.name))
-    for p in UNIQUE_PARTS:
+    for p in UNIT_PARTS:
         src = unit_backup / (p + ".bin")
         if src.is_file():
             dst = out_dir / (p + ".bin")

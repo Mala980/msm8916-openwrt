@@ -50,6 +50,9 @@ DEFAULT_PARTS = RADIO_PARTS + BOOT_PARTS
 # storage. Everything else on a stock dongle is identical across units of the
 # same stock firmware version (see the golden dumps in flasher/convert.py).
 UNIQUE_PARTS = ["fsc", "fsg", "modemst1", "modemst2", "persist", "sec", "DDR", "ssd"]
+# What convert mode keeps per unit: the unique partitions plus the unit's own
+# modem firmware, so a flash never depends on another unit's modem.bin.
+UNIT_PARTS = UNIQUE_PARTS + ["modem"]
 
 SERIAL_RE = re.compile(r"Serial:\s*(0x[0-9a-fA-F]+)")
 HWID_RE = re.compile(r"HWID:\s*(0x[0-9a-fA-F]+)")
@@ -361,6 +364,8 @@ def cmd_backup(a):
         return EXIT_ERR
     if a.parts == "unique":
         parts = UNIQUE_PARTS
+    elif a.parts == "unit":
+        parts = UNIT_PARTS
     else:
         parts = a.parts.split(",") if a.parts else DEFAULT_PARTS
 
@@ -541,7 +546,7 @@ def main(argv=None):
     b = sub.add_parser("backup", help="read partitions over EDL and store them")
     b.add_argument("--edl", help="edl executable (default: $EDL_BIN or edl on PATH)")
     b.add_argument("--serial", help="chip serial, if edl cannot report it")
-    b.add_argument("--parts", help="comma-separated partitions, or 'unique' (default: radio + boot chain)")
+    b.add_argument("--parts", help="comma-separated partitions, 'unique', or 'unit' (unique + modem) (default: radio + boot chain)")
     b.add_argument("--keep-duplicate", action="store_true", help="store even if unchanged")
     b.add_argument("--print-path", action="store_true", help="print the backup folder on stdout")
     b.add_argument("--identity", help="JSON file to keep as identity.json in the backup folder")
