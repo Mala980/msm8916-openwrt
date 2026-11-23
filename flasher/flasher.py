@@ -334,9 +334,10 @@ def restore_radio_only() -> int:
 
     check = subprocess.run([sys.executable, "-I", str(RADIO_BACKUP), "check", str(chosen), "--against", live])
     if check.returncode != 0:
-        print(f"\n{C_YELLOW}[!] {chosen.parent.name} is NOT this dongle. Restoring it gives this dongle the same "
-              f"IMEI and Wi-Fi/BT MAC as unit {chosen.parent.name}.{C_RESET}")
-        print(f"{C_YELLOW}    Do not use both on the same operator network at the same time.{C_RESET}")
+        print(f"\n{C_YELLOW}[!] {chosen.parent.name} is NOT this dongle. Its radio data is tied to that unit's "
+              f"chip: on this dongle the IMEI reads back EMPTY and the modem cannot register until an IMEI "
+              f"is written (Modem > Change IMEI, or change-imei <IMEI>).{C_RESET}")
+        print(f"{C_YELLOW}    Its RF calibration and Wi-Fi/BT MAC also come from {chosen.parent.name}.{C_RESET}")
         print(f"    To undo later, restore this dongle's own backup: {Path(live).relative_to(FLASHER_DIR)}")
         try:
             ans = input("Type YES (capital letters) to restore it anyway: ").strip()
@@ -356,6 +357,9 @@ def restore_radio_only() -> int:
             return 1
     edl_step(edl, "Rebooting the dongle", "reset")
     print(f"\n{C_GREEN}[*] Radio data restored from {chosen.relative_to(FLASHER_DIR)}.{C_RESET}")
+    if chosen.parent.name != this_unit:
+        print(f"{C_YELLOW}[!] Another unit's radio data: write this dongle's IMEI (from its label) once it has "
+              f"booted, e.g. ssh root@192.168.8.1 change-imei <15-digit IMEI>.{C_RESET}")
     return 0
 
 
