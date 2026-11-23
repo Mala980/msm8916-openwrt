@@ -5,14 +5,12 @@
 'require view';
 
 /*
-	Qualcomm Snapdragon 410 (MSM8916) 4G LTE Speedtest, Jitter & Latency Analyzer
-	Proton2025 Professional Dark Glass Theme
-	
-	Execution Sequence:
-	1. Phase 1/3: Ping Latency (Min/Avg/Max) & RFC 3550 Jitter (10 Probes)
-	2. Phase 2/3: 4G LTE Download Speedtest (Chunked Streaming, Live Dial & Curve)
-	3. Phase 3/3: 4G LTE Upload Speedtest (1:1 Equal Payload, XHR OnProgress Streaming & Curve)
-	4. Full Dual-Timeline Waveform: Both Download & Upload curves displayed from start to finish!
+	Speedtest page.
+	- Speedtest by Ookla: runs on the router (modem-speedtest ookla) with the
+	  official CLI, installed on request by ookla-speedtest-install.
+	- Browser test: ping, download and upload from this browser against the
+	  server it names (client -> router -> internet).
+	Both engines share the gauges, metric cards, throughput chart and history.
 */
 
 var callGetSignal = rpc.declare({
@@ -43,12 +41,6 @@ var callInstallOokla = rpc.declare({
 	object: 'luci.proton-system',
 	method: 'installOokla',
 	params: [ 'accept' ],
-	expect: { '': {} }
-});
-
-var callRemoveOokla = rpc.declare({
-	object: 'luci.proton-system',
-	method: 'removeOokla',
 	expect: { '': {} }
 });
 
@@ -169,7 +161,7 @@ function createDialGaugeSvg(type, dialId, valueId, peakId, stateBadgeId, maxVal,
 			'style': 'display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; color: var(--text-color-medium); font-family: monospace; margin-top: -6px;'
 		}, [
 			E('div', { 'style': 'display: flex; gap: 12px;' }, [
-				E('span', {}, 'Peak: <strong id="' + peakId + '" style="color:#fff;">0.00</strong> ' + unit),
+				E('span', {}, _('Peak') + ': <strong id="' + peakId + '" style="color:#fff;">0.00</strong> ' + unit),
 				E('span', {}, 'Max: ' + maxVal + ' ' + unit)
 			]),
 			E('span', {
@@ -200,19 +192,112 @@ return view.extend({
 		]);
 	},
 
-	// ---- Speedtest by Ookla (runs on the router) ---------------------------
+	// ---- Shared result helpers (used by both engines) ----------------------
+	engine: 'ookla',
+	ooklaState: {},
 	ooklaTimer: null,
+	ooklaRunning: false,
 
-	renderOoklaCard: function(st) {
+	setBadge: function(id, text, color) {
+		var el = document.getElementById(id);
+		if (!el) return;
+		el.textContent = text;
+		el.style.color = color || '';
+	},
+
+	setLatencyCards: function(avg, min, max, jitter, loss) {
+		var set = function(id, t) { var el = document.getElementById(id); if (el) el.textContent = t; };
+		var f = function(v) { return (v != null && v !== '' && !isNaN(v)) ? Number(v).toFixed(1) : null; };
+
+		set('st-ping-val', f(avg) ? f(avg) + ' ms' : '--');
+		set('st-ping-sub', (f(min) && f(max)) ? _('Low %s · High %s ms').format(f(min), f(max)) : '--');
+		if (f(avg)) this.setBadge('st-ping-badge', avg < 50 ? _('Low') : (avg < 100 ? _('Normal') : _('High')), avg < 50 ? '#10b981' : (avg < 100 ? '#38bdf8' : '#f59e0b'));
+
+		set('st-jitter-val', f(jitter) ? f(jitter) + ' ms' : '--');
+		if (f(jitter)) this.setBadge('st-jitter-badge', jitter < 10 ? _('Stable') : (jitter < 30 ? _('Moderate') : _('High')), jitter < 10 ? '#10b981' : (jitter < 30 ? '#38bdf8' : '#ef4444'));
+
+		if (loss != null && loss !== '' && !isNaN(loss)) {
+			var l = Number(loss);
+			set('st-loss-val', (l % 1 ? l.toFixed(1) : l) + '%');
+			set('st-loss-sub', l === 0 ? _('All packets received') : _('Packets lost during the test'));
+			this.setBadge('st-loss-badge', l === 0 ? _('None') : _('Loss'), l === 0 ? '#10b981' : '#ef4444');
+		}
+	},
+
+	// Network card from getSignalDetails: real operator/band, or "No service".
+	setNetworkCard: function(sig) {
+		var set = function(id, t) { var el = document.getElementById(id); if (el) el.textContent = t; };
+		var op = (sig && sig.operator) || {}, sv = (sig && sig.serving) || {}, sg = (sig && sig.signal) || {};
+		if (!sig || !op.registered) {
+			set('st-radio-val', _('No service'));
+			set('st-radio-sub', '--');
+			this.setBadge('st-radio-badge', '--');
+			return { label: '' };
+		}
+		var label = sv.band || '';
+		set('st-radio-val', (op.name || '--') + (label ? ' · ' + label : ''));
+		set('st-radio-sub', (sg.rsrp && sg.rsrp !== '--' ? 'RSRP ' + sg.rsrp + ' dBm' : 'RSRP --') + (sg.snr && sg.snr !== '--' ? ' · SNR ' + sg.snr + ' dB' : ''));
+		this.setBadge('st-radio-badge', op.reg_state === 'roaming' ? _('Roaming') : _('Home'), '#38bdf8');
+		return { label: label };
+	},
+
+	resetResults: function() {
+		this.peakDownload = 0;
+		this.peakUpload = 0;
+		this.downloadPoints = [];
+		this.uploadPoints = [];
+		this.drawWaveform();
+		['st-dl-val', 'st-ul-val'].forEach(function(id) { var el = document.getElementById(id); if (el) el.textContent = '0.00'; });
+		['st-dl-peak', 'st-ul-peak'].forEach(function(id) { var el = document.getElementById(id); if (el) el.textContent = '0.00'; });
+		this.updateDial('st-dl-dial', 0, 100);
+		this.updateDial('st-ul-dial', 0, 50);
+		var meta = document.getElementById('st-result-meta');
+		if (meta) dom.content(meta, []);
+	},
+
+	setRunning: function(running) {
+		var btnStart = document.getElementById('btn-start-speedtest');
+		var btnStop = document.getElementById('btn-stop-speedtest');
+		if (btnStart) { btnStart.disabled = running; btnStart.style.opacity = running ? '0.5' : '1'; }
+		if (btnStop) btnStop.style.display = running ? 'inline-flex' : 'none';
+		document.querySelectorAll('.st-engine-tab').forEach(function(t) { t.disabled = running; });
+	},
+
+	selectEngine: function(engine) {
+		this.engine = engine;
+		document.querySelectorAll('.st-engine-tab').forEach(function(t) {
+			var on = (t.getAttribute('data-engine') === engine);
+			t.classList.toggle('st-engine-active', on);
+			t.setAttribute('aria-pressed', on ? 'true' : 'false');
+		});
+		var po = document.getElementById('st-panel-ookla'), pb = document.getElementById('st-panel-browser');
+		if (po) po.style.display = (engine === 'ookla') ? '' : 'none';
+		if (pb) pb.style.display = (engine === 'browser') ? '' : 'none';
+		this.updateStartButton();
+		try { localStorage.setItem('modem_speedtest_engine', engine); } catch(e) {}
+	},
+
+	updateStartButton: function() {
+		var btn = document.getElementById('btn-start-speedtest');
+		if (!btn) return;
+		var blocked = (this.engine === 'ookla' && !this.ooklaState.installed);
+		btn.disabled = blocked || this.isRunning || this.ooklaRunning;
+		btn.style.opacity = btn.disabled ? '0.5' : '1';
+		btn.title = blocked ? _('Install the Speedtest CLI first') : '';
+	},
+
+	// ---- Speedtest by Ookla (runs on the router) ---------------------------
+	renderOoklaPanel: function(st) {
 		var self = this;
-		var body = document.getElementById('ookla-card-body');
+		var body = document.getElementById('st-panel-ookla');
 		if (!body) return;
 		st = st || {};
+		this.ooklaState = st;
 
 		if (!st.installed) {
 			var accept = E('input', { 'type': 'checkbox', 'id': 'ookla-accept' });
 			var btn = E('button', {
-				'class': 'cbi-button cbi-button-apply',
+				'class': 'cbi-button cbi-button-action',
 				'disabled': st.installing ? 'disabled' : null,
 				'click': function(ev) {
 					ev.preventDefault();
@@ -222,12 +307,12 @@ return view.extend({
 					}
 					callInstallOokla(true).then(function() { self.pollOoklaInstall(); });
 				}
-			}, st.installing ? _('Installing...') : _('Download and install'));
+			}, st.installing ? _('Installing…') : _('Install Speedtest CLI'));
 
 			dom.content(body, [
-				E('p', { 'style': 'margin: 0 0 8px; font-size: 12px;' },
-					_('The official Speedtest CLI measures from the router itself, with multiple connections, against a real Ookla server near you (often your operator\'s own), so results match the Speedtest app on a phone or computer. It is proprietary and free for personal, non-commercial use, so it is not included in the firmware: it is downloaded from Ookla (about 1 MB) and checked before it is installed. Once installed you can also run "speedtest" in an SSH shell.')),
-				E('label', { 'style': 'display: flex; gap: 8px; align-items: flex-start; font-size: 12px; margin-bottom: 10px;' }, [
+				E('div', { 'class': 'st-note' },
+					_('Runs on the router with multiple connections against a nearby Ookla server, so results match the Speedtest app. The CLI is free for personal, non-commercial use and is downloaded from Ookla (about 1 MB) when you install it. It is then also available as "speedtest" in an SSH shell.')),
+				E('label', { 'class': 'st-accept' }, [
 					accept,
 					E('span', {}, [
 						_('I accept the Speedtest by Ookla '),
@@ -236,15 +321,16 @@ return view.extend({
 						E('a', { 'href': st.privacy, 'target': '_blank', 'rel': 'noopener' }, _('Privacy Policy')), '.'
 					])
 				]),
-				E('div', { 'style': 'display: flex; align-items: center; gap: 10px;' }, [
+				E('div', { 'style': 'display: flex; align-items: center; gap: 10px; flex-wrap: wrap;' }, [
 					btn,
 					st.error ? E('span', { 'style': 'color: #f87171; font-size: 12px;' }, _('Install failed: %s').format(st.error)) : ''
 				])
 			]);
+			this.updateStartButton();
 			return;
 		}
 
-		var serverSelect = E('select', { 'class': 'cbi-input-select', 'id': 'ookla-server', 'style': 'min-width: 260px;' }, [
+		var serverSelect = E('select', { 'class': 'cbi-input-select st-input', 'id': 'ookla-server' }, [
 			E('option', { 'value': '' }, _('Nearest server (automatic)'))
 		]);
 		var loadServers = E('button', {
@@ -252,122 +338,108 @@ return view.extend({
 			'click': function(ev) {
 				ev.preventDefault();
 				loadServers.disabled = true;
-				loadServers.textContent = _('Loading...');
+				loadServers.textContent = _('Loading…');
 				callListOoklaServers().then(function(r) {
 					(r.servers || []).forEach(function(sv) {
 						serverSelect.appendChild(E('option', { 'value': String(sv.id) },
 							sv.name + ' — ' + sv.location + (sv.country ? ', ' + sv.country : '')));
 					});
-					loadServers.textContent = (r.servers && r.servers.length) ? _('Servers loaded') : (r.error || _('No servers found'));
-				}).catch(function() { loadServers.disabled = false; loadServers.textContent = _('Load server list'); });
+					loadServers.textContent = (r.servers && r.servers.length) ? _('%d servers').format(r.servers.length) : _('Server list unavailable');
+				}).catch(function() { loadServers.disabled = false; loadServers.textContent = _('Choose server'); });
 			}
-		}, _('Load server list'));
+		}, _('Choose server'));
 
 		dom.content(body, [
-			E('div', { 'style': 'display: flex; flex-wrap: wrap; align-items: center; gap: 8px;' }, [
-				serverSelect,
-				loadServers,
-				E('button', { 'class': 'cbi-button cbi-button-apply', 'id': 'ookla-run', 'click': function(ev) { ev.preventDefault(); self.runOokla(serverSelect.value); } }, _('Run Speedtest by Ookla')),
-				E('button', { 'class': 'cbi-button cbi-button-reset', 'id': 'ookla-stop', 'style': 'display: none;', 'click': function(ev) {
-					ev.preventDefault();
-					callCancelSpeedtest().then(function() { self.stopOoklaPoll(); self.showOoklaStatus({ state: 'idle', step_label: _('Cancelled') }); });
-				} }, _('Stop'))
-			]),
-			E('div', { 'id': 'ookla-status', 'style': 'margin-top: 10px; font-size: 12px; color: var(--text-color-medium);' },
-				_('Speedtest CLI %s installed.').format(st.version || '')),
-			E('div', { 'style': 'width: 100%; height: 6px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; margin-top: 6px;' }, [
-				E('div', { 'id': 'ookla-progress', 'style': 'width: 0%; height: 100%; background: #38bdf8; transition: width 0.3s ease;' })
-			]),
-			E('div', { 'id': 'ookla-result', 'style': 'margin-top: 12px;' }),
-			E('div', { 'style': 'margin-top: 10px; font-size: 11px;' }, [
-				E('a', { 'href': '#', 'click': function(ev) {
-					ev.preventDefault();
-					if (!confirm(_('Remove the Speedtest CLI from the router?'))) return;
-					callRemoveOokla().then(function(r) { self.renderOoklaCard(r); });
-				} }, _('Remove Speedtest CLI'))
-			])
+			E('label', { 'class': 'st-label' }, _('Server')),
+			E('div', { 'style': 'display: flex; gap: 8px; flex-wrap: wrap;' }, [ serverSelect, loadServers ]),
+			E('div', { 'class': 'st-hint' }, _('Speedtest CLI %s on the router · multi-connection').format(st.version || ''))
 		]);
+		this.updateStartButton();
 	},
 
 	pollOoklaInstall: function() {
 		var self = this;
 		callOoklaStatus().then(function(st) {
-			self.renderOoklaCard(st);
+			self.renderOoklaPanel(st);
 			if (st.installing) setTimeout(function() { self.pollOoklaInstall(); }, 2000);
 		});
 	},
 
-	stopOoklaPoll: function() {
+	finishOokla: function() {
 		if (this.ooklaTimer) clearInterval(this.ooklaTimer);
 		this.ooklaTimer = null;
-		var run = document.getElementById('ookla-run'), stop = document.getElementById('ookla-stop');
-		if (run) run.disabled = false;
-		if (stop) stop.style.display = 'none';
-	},
-
-	showOoklaStatus: function(d) {
-		var self = this;
-		var st = document.getElementById('ookla-status');
-		var bar = document.getElementById('ookla-progress');
-		var res = document.getElementById('ookla-result');
-		if (st) st.textContent = d.state === 'failed' ? _('Failed: %s').format(d.error || d.step_label) : (d.step_label || '');
-		if (st) st.style.color = d.state === 'failed' ? '#f87171' : '';
-		if (bar) bar.style.width = (d.progress || 0) + '%';
-
-		if (d.download_mbps) self.updateDial('st-dl-dial', d.download_mbps, 100);
-		if (d.upload_mbps) self.updateDial('st-ul-dial', d.upload_mbps, 50);
-		var dv = document.getElementById('st-dl-val'), uv = document.getElementById('st-ul-val');
-		if (dv && d.download_mbps) dv.textContent = Number(d.download_mbps).toFixed(2);
-		if (uv && d.upload_mbps) uv.textContent = Number(d.upload_mbps).toFixed(2);
-
-		if (res && (d.state === 'completed' || d.state === 'running')) {
-			var cell = function(label, val, color) {
-				return E('div', { 'style': 'padding: 8px 10px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color-medium); border-radius: 6px;' }, [
-					E('div', { 'style': 'font-size: 10px; text-transform: uppercase; color: var(--text-color-medium);' }, label),
-					E('div', { 'style': 'font-size: 16px; font-weight: 800; font-family: monospace;' + (color ? ' color: ' + color + ';' : '') }, val)
-				]);
-			};
-			dom.content(res, [
-				E('div', { 'style': 'display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px;' }, [
-					cell(_('Download'), d.download_mbps ? d.download_mbps + ' Mbps' : '--', '#38bdf8'),
-					cell(_('Upload'), d.upload_mbps ? d.upload_mbps + ' Mbps' : '--', '#34d399'),
-					cell(_('Ping'), d.ping_avg ? d.ping_avg + ' ms' : '--'),
-					cell(_('Jitter'), d.jitter ? d.jitter + ' ms' : '--'),
-					cell(_('Packet loss'), d.state === 'completed' ? (d.packet_loss || 0) + '%' : '--')
-				]),
-				E('div', { 'style': 'margin-top: 8px; font-size: 12px; color: var(--text-color-medium);' }, [
-					d.server ? _('Server: %s').format(d.server + (d.location ? ' (' + d.location + ')' : '')) : '',
-					d.isp ? ' · ' + _('ISP: %s').format(d.isp) : '',
-					d.result_url ? [' · ', E('a', { 'href': d.result_url, 'target': '_blank', 'rel': 'noopener' }, _('View result on speedtest.net'))] : ''
-				])
-			]);
-		}
+		this.ooklaRunning = false;
+		this.setRunning(false);
+		this.updateStartButton();
 	},
 
 	runOokla: function(serverId) {
 		var self = this;
-		var run = document.getElementById('ookla-run'), stop = document.getElementById('ookla-stop');
-		if (run) run.disabled = true;
-		if (stop) stop.style.display = '';
-		self.showOoklaStatus({ state: 'running', step_label: _('Starting...'), progress: 2 });
+		this.ooklaRunning = true;
+		this.setRunning(true);
+		this.resetResults();
+		this.setGaugeState('download', _('Waiting'), '#94a3b8');
+		this.setGaugeState('upload', _('Waiting'), '#94a3b8');
+		this.updateProgress(2, _('Starting Speedtest by Ookla…'), '#94a3b8');
+		callGetSignal().then(function(sig) { self.setNetworkCard(sig); }).catch(function() {});
 
 		callStartRouterSpeedtest('ookla', 'standard', serverId || '').then(function() {
 			if (self.ooklaTimer) clearInterval(self.ooklaTimer);
 			self.ooklaTimer = setInterval(function() {
 				callGetSpeedtestStatus().then(function(d) {
-					if (!d || d.engine !== 'ookla') return;
-					self.showOoklaStatus(d);
-					if (d.state === 'completed' || d.state === 'failed') {
-						self.stopOoklaPoll();
-						if (d.state === 'completed') {
-							self.localHistory = [d].concat(self.localHistory || []).slice(0, 10);
-							try { localStorage.setItem('modem_speedtest_history', JSON.stringify(self.localHistory)); } catch(e) {}
-							self.renderHistoryTable(self.localHistory);
-						}
-					}
+					if (!d || d.engine !== 'ookla' || !self.ooklaRunning) return;
+					self.showOoklaProgress(d);
 				});
 			}, 1000);
 		});
+	},
+
+	showOoklaProgress: function(d) {
+		var dl = Number(d.download_mbps) || 0, ul = Number(d.upload_mbps) || 0;
+		var set = function(id, t) { var el = document.getElementById(id); if (el) el.textContent = t; };
+
+		if (d.step === 'download' && dl) {
+			this.peakDownload = Math.max(this.peakDownload || 0, dl);
+			this.downloadPoints.push(dl);
+			if (this.downloadPoints.length > this.maxPointsPerPhase) this.downloadPoints.shift();
+			this.setGaugeState('download', _('Testing'), '#38bdf8', 'rgba(56,189,248,0.15)');
+		}
+		if (d.step === 'upload' && ul) {
+			this.peakUpload = Math.max(this.peakUpload || 0, ul);
+			this.uploadPoints.push(ul);
+			if (this.uploadPoints.length > this.maxPointsPerPhase) this.uploadPoints.shift();
+			this.setGaugeState('download', _('Done'), '#10b981', 'rgba(16,185,129,0.15)');
+			this.setGaugeState('upload', _('Testing'), '#34d399', 'rgba(52,211,153,0.15)');
+		}
+		if (dl) { set('st-dl-val', dl.toFixed(2)); set('st-dl-peak', (this.peakDownload || dl).toFixed(2)); this.updateDial('st-dl-dial', dl, 100); }
+		if (ul) { set('st-ul-val', ul.toFixed(2)); set('st-ul-peak', (this.peakUpload || ul).toFixed(2)); this.updateDial('st-ul-dial', ul, 50); }
+		if (d.ping_avg) this.setLatencyCards(d.ping_avg, d.ping_min, d.ping_max, d.jitter, d.state === 'completed' ? d.packet_loss : null);
+		this.drawWaveform();
+
+		var color = d.step === 'upload' ? '#34d399' : (d.step === 'download' ? '#38bdf8' : '#94a3b8');
+		if (d.state === 'failed') {
+			this.updateProgress(100, _('Failed: %s').format(d.error || d.step_label || ''), '#ef4444');
+			this.finishOokla();
+			return;
+		}
+		if (d.state !== 'completed') {
+			this.updateProgress(d.progress || 0, d.step_label || '', color);
+			return;
+		}
+
+		this.updateProgress(100, _('Done · Download %s Mbps · Upload %s Mbps').format(dl.toFixed(1), ul.toFixed(1)), 'linear-gradient(90deg, #38bdf8, #34d399)');
+		this.setGaugeState('download', _('Done'), '#10b981', 'rgba(16,185,129,0.15)');
+		this.setGaugeState('upload', _('Done'), '#10b981', 'rgba(16,185,129,0.15)');
+		var meta = document.getElementById('st-result-meta');
+		if (meta) dom.content(meta, [
+			d.server ? E('span', {}, _('Server: %s').format(d.server + (d.location ? ', ' + d.location : ''))) : '',
+			d.isp ? E('span', {}, _('ISP: %s').format(d.isp)) : '',
+			d.result_url ? E('a', { 'href': d.result_url, 'target': '_blank', 'rel': 'noopener' }, _('View result on speedtest.net')) : ''
+		]);
+		this.localHistory = [d].concat(this.localHistory || []).slice(0, 15);
+		try { localStorage.setItem('modem_speedtest_history', JSON.stringify(this.localHistory)); } catch(e) {}
+		this.renderHistoryTable(this.localHistory);
+		this.finishOokla();
 	},
 
 	updateDial: function(dialId, val, maxVal) {
@@ -423,9 +495,9 @@ return view.extend({
 		ctx.setLineDash([]);
 
 		ctx.fillStyle = '#38bdf8';
-		ctx.fillText(_('DOWNLOAD STREAM (1:1 Payload)'), 60, h - 4);
+		ctx.fillText(_('DOWNLOAD'), 60, h - 4);
 		ctx.fillStyle = '#34d399';
-		ctx.fillText(_('UPLOAD STREAM (1:1 Payload)'), midX + 20, h - 4);
+		ctx.fillText(_('UPLOAD'), midX + 20, h - 4);
 
 		// 3. Draw Download Curve (Left Half: 0 to midX)
 		if (this.downloadPoints.length >= 2) {
@@ -505,7 +577,7 @@ return view.extend({
 		if (!list || list.length === 0) {
 			tbody.appendChild(E('tr', {}, [
 				E('td', { 'colspan': 8, 'style': 'text-align: center; color: var(--text-color-medium); padding: 14px; font-style: italic;' }, 
-					_('No speedtest history records yet. Click "START SPEEDTEST" above to run an analysis.')
+					_('No results yet.')
 				)
 			]));
 			return;
@@ -515,8 +587,9 @@ return view.extend({
 			tbody.appendChild(E('tr', {}, [
 				E('td', { 'style': 'font-family: monospace; font-size: 11px;' }, row.timestamp || '--'),
 				E('td', { 'style': 'font-weight: 600;' }, [
-					E('div', {}, (row.engine === 'ookla' ? 'Ookla · ' : '') + (row.server || '--')),
-					E('div', { 'style': 'font-size: 10px; color: var(--text-color-medium);' }, row.location || row.target || '')
+					E('div', {}, row.server || '--'),
+					E('div', { 'style': 'font-size: 10px; color: var(--text-color-medium);' },
+						(row.engine === 'ookla' ? 'Ookla' : (row.engine === 'browser' ? _('Browser') : '')) + (row.location ? ' · ' + row.location : ''))
 				]),
 				E('td', { 'style': 'font-family: monospace; color: #38bdf8;' }, row.band || '--'),
 				E('td', { 'style': 'font-family: monospace; font-weight: 600;' }, (row.ping_avg ? row.ping_avg + ' ms' : '--')),
@@ -555,43 +628,19 @@ return view.extend({
 		this.activeAbortController = new AbortController();
 		var signal = this.activeAbortController.signal;
 
-		var btnStart = document.getElementById('btn-start-speedtest');
-		var btnStop = document.getElementById('btn-stop-speedtest');
-		if (btnStart) { btnStart.disabled = true; btnStart.style.opacity = '0.5'; }
-		if (btnStop) btnStop.style.display = 'inline-flex';
+		this.setRunning(true);
 
-		this.peakDownload = 0;
-		this.peakUpload = 0;
-		this.downloadPoints = [];
-		this.uploadPoints = [];
-		this.drawWaveform();
+		this.resetResults();
+		this.setGaugeState('download', _('Waiting'), '#94a3b8');
+		this.setGaugeState('upload', _('Waiting'), '#94a3b8');
 
-		this.setGaugeState('download', 'Waiting...', '#94a3b8');
-		this.setGaugeState('upload', 'Waiting...', '#94a3b8');
-
-		// Query Radio Cell status
-		var rfInfo = { band: 'LTE', rsrp: '--', sinr: '--', op: 'Indosat' };
-		try {
-			var sigData = await callGetSignal();
-			if (sigData && sigData.serving) {
-				rfInfo.band = sigData.serving.band || 'LTE';
-				rfInfo.rsrp = sigData.serving.rsrp || '--';
-				rfInfo.sinr = sigData.signal ? sigData.signal.snr : '--';
-				rfInfo.op = sigData.operator ? sigData.operator.name : 'Indosat';
-			}
-		} catch(e) {}
-
-		var elRadioVal = document.getElementById('st-radio-val');
-		var elRadioSub = document.getElementById('st-radio-sub');
-		var elRadioBadge = document.getElementById('st-radio-badge');
-		if (elRadioVal) elRadioVal.textContent = rfInfo.band + (rfInfo.rsrp !== '--' ? ' (' + rfInfo.rsrp + ' dBm)' : '');
-		if (elRadioSub) elRadioSub.textContent = rfInfo.op + ' | ' + gwConfig.name;
-		if (elRadioBadge) { elRadioBadge.textContent = gwConfig.location; elRadioBadge.style.color = '#38bdf8'; }
+		var rfInfo = { band: '' };
+		try { rfInfo.band = this.setNetworkCard(await callGetSignal()).label; } catch(e) {}
 
 		// ==========================================
 		// PHASE 1/3: PING LATENCY & RFC 3550 JITTER
 		// ==========================================
-		this.updateProgress(10, _('[Phase 1/3] Measuring Ping Latency & Jitter (10 Probes)...'), '#94a3b8');
+		this.updateProgress(10, _('Measuring latency…'), '#94a3b8');
 		var pingTimes = [];
 		var drops = 0;
 		var pingUrl = gwConfig.pingUrl || 'https://speed.cloudflare.com/__down?bytes=0';
@@ -608,7 +657,7 @@ return view.extend({
 				if (err.name === 'AbortError') return;
 				drops++;
 			}
-			self.updateProgress(10 + p * 1.5, _('[Phase 1/3] Measuring Latency Probe ') + (p + 1) + '/10...', '#94a3b8');
+			self.updateProgress(10 + p * 1.5, _('Measuring latency… %d/10').format(p + 1), '#94a3b8');
 		}
 
 		var minPing = 0, avgPing = 0, maxPing = 0, jitter = 0, lossPct = 0;
@@ -627,43 +676,13 @@ return view.extend({
 		}
 		lossPct = Math.round((drops / 10) * 100);
 
-		// Update Ping & Jitter Cards
-		var elPingVal = document.getElementById('st-ping-val');
-		var elPingSub = document.getElementById('st-ping-sub');
-		var elPingBadge = document.getElementById('st-ping-badge');
-		if (elPingVal) elPingVal.textContent = avgPing.toFixed(1) + ' ms';
-		if (elPingSub) elPingSub.textContent = 'Min: ' + minPing.toFixed(1) + ' | Max: ' + maxPing.toFixed(1) + ' ms';
-		if (elPingBadge) {
-			if (avgPing < 50) { elPingBadge.textContent = 'Low Latency'; elPingBadge.style.color = '#10b981'; }
-			else if (avgPing < 95) { elPingBadge.textContent = 'Normal'; elPingBadge.style.color = '#38bdf8'; }
-			else { elPingBadge.textContent = 'High'; elPingBadge.style.color = '#f59e0b'; }
-		}
-
-		var elJitterVal = document.getElementById('st-jitter-val');
-		var elJitterBadge = document.getElementById('st-jitter-badge');
-		if (elJitterVal) elJitterVal.textContent = jitter.toFixed(1) + ' ms';
-		if (elJitterBadge) {
-			if (jitter < 8) { elJitterBadge.textContent = 'Ultra Stable'; elJitterBadge.style.color = '#10b981'; }
-			else if (jitter < 25) { elJitterBadge.textContent = 'Good'; elJitterBadge.style.color = '#38bdf8'; }
-			else { elJitterBadge.textContent = 'High Jitter'; elJitterBadge.style.color = '#ef4444'; }
-		}
-
-		var elLossVal = document.getElementById('st-loss-val');
-		var elLossSub = document.getElementById('st-loss-sub');
-		var elLossBadge = document.getElementById('st-loss-badge');
-		if (elLossVal) elLossVal.textContent = lossPct + '%';
-		if (elLossSub) elLossSub.textContent = (lossPct === 0 ? '100% Packets Received' : 'Packet Drops Observed');
-		if (elLossBadge) {
-			elLossBadge.textContent = (lossPct === 0 ? 'Zero Loss' : 'Lossy');
-			elLossBadge.style.color = (lossPct === 0 ? '#10b981' : '#ef4444');
-		}
+		this.setLatencyCards(avgPing, minPing, maxPing, jitter, lossPct);
 
 		// ==========================================
 		// PHASE 2/3: 4G LTE DOWNLOAD SPEEDTEST (FIRST)
 		// ==========================================
 		var payloadMb = (sizeConfig.bytes / 1000000).toFixed(0);
-		this.setGaugeState('download', 'Testing Stream...', '#38bdf8', 'rgba(56,189,248,0.15)');
-		this.setGaugeState('upload', 'Waiting Phase 3...', '#94a3b8');
+		this.setGaugeState('download', _('Testing'), '#38bdf8', 'rgba(56,189,248,0.15)');
 
 		var downBytesTarget = sizeConfig.bytes;
 		var downUrl = gwConfig.downUrl + downBytesTarget + '&t=' + Date.now();
@@ -700,7 +719,7 @@ return view.extend({
 						self.drawWaveform();
 
 						var dlPct = 25 + Math.min(35, (receivedBytes / downBytesTarget) * 35);
-						self.updateProgress(dlPct, _('[Phase 2/3] Downloading: ') + (receivedBytes / 1048576).toFixed(1) + ' / ' + payloadMb + ' MB (' + instantMbps.toFixed(2) + ' Mbps)', '#38bdf8');
+						self.updateProgress(dlPct, _('Download · %s Mbps').format(instantMbps.toFixed(2)), '#38bdf8');
 					}
 				}
 				var totalDlSec = (performance.now() - dlStart) / 1000.0;
@@ -712,13 +731,13 @@ return view.extend({
 
 		var elDlFinal = document.getElementById('st-dl-val');
 		if (elDlFinal && finalDlMbps > 0) elDlFinal.textContent = finalDlMbps.toFixed(2);
-		this.setGaugeState('download', 'Completed (Peak ' + this.peakDownload.toFixed(1) + 'M)', '#10b981', 'rgba(16,185,129,0.15)');
+		this.setGaugeState('download', _('Done'), '#10b981', 'rgba(16,185,129,0.15)');
 
 		// ==========================================
 		// PHASE 3/3: 4G LTE UPLOAD SPEEDTEST (1:1 EQUAL PAYLOAD)
 		// ==========================================
-		this.setGaugeState('upload', 'Testing Stream...', '#34d399', 'rgba(52,211,153,0.15)');
-		this.updateProgress(62, _('[Phase 3/3] Preparing 1:1 Upload Payload (' + payloadMb + ' MB)...'), '#34d399');
+		this.setGaugeState('upload', _('Testing'), '#34d399', 'rgba(52,211,153,0.15)');
+		this.updateProgress(62, _('Preparing upload…'), '#34d399');
 
 		var upBytesTarget = sizeConfig.bytes; // EXACT 1:1 RATIO WITH DOWNLOAD!
 		var upPayload = new Uint8Array(upBytesTarget);
@@ -757,7 +776,7 @@ return view.extend({
 					self.drawWaveform();
 
 					var ulPct = 62 + Math.min(36, (e.loaded / upBytesTarget) * 36);
-					self.updateProgress(ulPct, _('[Phase 3/3] Uploading (1:1): ') + (e.loaded / 1048576).toFixed(1) + ' / ' + payloadMb + ' MB (' + instantMbps.toFixed(2) + ' Mbps)', '#34d399');
+					self.updateProgress(ulPct, _('Upload · %s Mbps').format(instantMbps.toFixed(2)), '#34d399');
 				}
 			};
 
@@ -779,7 +798,7 @@ return view.extend({
 
 		var elUlFinal = document.getElementById('st-ul-val');
 		if (elUlFinal && finalUlMbps > 0) elUlFinal.textContent = finalUlMbps.toFixed(2);
-		this.setGaugeState('upload', 'Completed (Peak ' + this.peakUpload.toFixed(1) + 'M)', '#10b981', 'rgba(16,185,129,0.15)');
+		this.setGaugeState('upload', _('Done'), '#10b981', 'rgba(16,185,129,0.15)');
 
 		// Redraw final full waveform with both curves intact!
 		this.drawWaveform();
@@ -787,7 +806,7 @@ return view.extend({
 		// ==========================================
 		// PHASE 4: FINAL COMPLETION & LOGGING
 		// ==========================================
-		this.updateProgress(100, _('Benchmark Completed: DL ') + finalDlMbps.toFixed(1) + ' Mbps | UL ' + finalUlMbps.toFixed(1) + ' Mbps', 'linear-gradient(90deg, #38bdf8, #34d399)');
+		this.updateProgress(100, _('Done · Download %s Mbps · Upload %s Mbps').format(finalDlMbps.toFixed(1), finalUlMbps.toFixed(1)), 'linear-gradient(90deg, #38bdf8, #34d399)');
 
 		var nowD = new Date();
 		var ts = nowD.getFullYear() + '-' + 
@@ -801,6 +820,7 @@ return view.extend({
 			timestamp: ts,
 			server: gwConfig.name,
 			location: gwConfig.location,
+			engine: 'browser',
 			band: rfInfo.band,
 			ping_avg: avgPing > 0 ? avgPing.toFixed(1) : '--',
 			jitter: jitter > 0 ? jitter.toFixed(1) : '--',
@@ -820,6 +840,14 @@ return view.extend({
 	},
 
 	stopSpeedtest: function() {
+		if (this.ooklaRunning) {
+			var self = this;
+			callCancelSpeedtest().then(function() {
+				self.updateProgress(0, _('Cancelled'), '#94a3b8');
+				self.finishOokla();
+			});
+			return;
+		}
 		if (this.activeAbortController) {
 			this.activeAbortController.abort();
 			this.activeAbortController = null;
@@ -829,294 +857,231 @@ return view.extend({
 			this.activeXhr = null;
 		}
 		this.isRunning = false;
-		var btnStart = document.getElementById('btn-start-speedtest');
-		var btnStop = document.getElementById('btn-stop-speedtest');
-		if (btnStart) { btnStart.disabled = false; btnStart.style.opacity = '1'; }
-		if (btnStop) btnStop.style.display = 'none';
+		this.setRunning(false);
+		this.updateStartButton();
 	},
 
 	render: function(loadData) {
 		var self = this;
 		var initialSig = (loadData && loadData[0]) ? loadData[0] : null;
 		var initialHist = (loadData && loadData[1]) ? loadData[1] : [];
+		var ooklaInitial = (loadData && loadData[2]) ? loadData[2] : {};
 		this.localHistory = initialHist || [];
+		this.ooklaState = ooklaInitial;
 
 		try {
 			var cachedLocal = JSON.parse(localStorage.getItem('modem_speedtest_history') || '[]');
-			if (cachedLocal && cachedLocal.length > 0) {
-				this.localHistory = cachedLocal;
-			}
+			if (cachedLocal && cachedLocal.length > 0) this.localHistory = cachedLocal;
 		} catch(e) {}
 
-		// Gateway Dropdown
+		var startEngine = 'ookla';
+		try { startEngine = localStorage.getItem('modem_speedtest_engine') || 'ookla'; } catch(e) {}
+		if (startEngine !== 'browser') startEngine = 'ookla';
+
+		// --- Browser test controls ---
+		var customGwBox = E('div', { 'id': 'st-custom-gw-box', 'class': 'st-custom-grid', 'style': 'display: none;' }, [
+			E('input', { 'id': 'st-custom-ping', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('Ping URL') }),
+			E('input', { 'id': 'st-custom-down', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('Download URL (size is appended)') }),
+			E('input', { 'id': 'st-custom-up', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('Upload URL') })
+		]);
+
 		var gwSelect = E('select', {
-			'id': 'st-gateway-select',
-			'class': 'cbi-input-select',
-			'style': 'padding: 6px 12px; font-size: 13px; border-radius: 6px; width: 100%; max-width: 400px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color-medium);',
-			'change': function(ev) {
-				var customBox = document.getElementById('st-custom-gw-box');
-				if (customBox) {
-					customBox.style.display = (ev.target.value === 'custom') ? 'grid' : 'none';
-				}
-			}
-		});
+			'id': 'st-gateway-select', 'class': 'cbi-input-select st-input',
+			'change': function(ev) { customGwBox.style.display = (ev.target.value === 'custom') ? 'grid' : 'none'; }
+		}, GATEWAYS.map(function(g) { return E('option', { 'value': g.id }, g.name); }));
 
-		GATEWAYS.forEach(function(g) {
-			gwSelect.appendChild(E('option', { 'value': g.id }, g.name));
-		});
-
-		// Test Size Dropdown (Strict 1:1 Payload ratio)
-		var sizeSelect = E('select', {
-			'id': 'st-size-select',
-			'class': 'cbi-input-select',
-			'style': 'padding: 6px 12px; font-size: 13px; border-radius: 6px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color-medium);'
-		}, [
-			E('option', { 'value': 'fast' }, _('Fast Probe: 5 MB DL & 5 MB UL (1:1 Ratio)')),
-			E('option', { 'value': 'standard', 'selected': 'selected' }, _('Standard Benchmark: 10 MB DL & 10 MB UL (1:1 Ratio)')),
-			E('option', { 'value': 'deep' }, _('Stress Test: 25 MB DL & 25 MB UL (1:1 Ratio)'))
+		var sizeSelect = E('select', { 'id': 'st-size-select', 'class': 'cbi-input-select st-input' }, [
+			E('option', { 'value': 'fast' }, _('Quick (5 MB each way)')),
+			E('option', { 'value': 'standard', 'selected': 'selected' }, _('Standard (10 MB each way)')),
+			E('option', { 'value': 'deep' }, _('Extended (25 MB each way)'))
 		]);
 
-		// Custom Gateway Fields
-		var customGwBox = E('div', {
-			'id': 'st-custom-gw-box',
-			'style': 'display: none; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; width: 100%;'
-		}, [
-			E('input', {
-				'id': 'st-custom-ping',
-				'type': 'text',
-				'class': 'cbi-input-text',
-				'placeholder': 'Ping URL (e.g. https://server/ping)',
-				'style': 'font-size: 12px; padding: 6px 10px;'
-			}),
-			E('input', {
-				'id': 'st-custom-down',
-				'type': 'text',
-				'class': 'cbi-input-text',
-				'placeholder': 'Download URL (e.g. https://server/file.bin)',
-				'style': 'font-size: 12px; padding: 6px 10px;'
-			}),
-			E('input', {
-				'id': 'st-custom-up',
-				'type': 'text',
-				'class': 'cbi-input-text',
-				'placeholder': 'Upload URL (e.g. https://server/upload)',
-				'style': 'font-size: 12px; padding: 6px 10px;'
-			})
-		]);
+		// --- Engine switch ---
+		var engineTab = function(id, title, sub) {
+			return E('button', {
+				'class': 'st-engine-tab', 'data-engine': id, 'aria-pressed': 'false',
+				'click': function(ev) { ev.preventDefault(); self.selectEngine(id); }
+			}, [ E('span', { 'class': 'st-engine-title' }, title), E('span', { 'class': 'st-engine-sub' }, sub) ]);
+		};
 
-		// Start & Stop Buttons
 		var btnStart = E('button', {
-			'id': 'btn-start-speedtest',
-			'class': 'cbi-button cbi-button-action',
-			'style': 'font-size: 13.5px; font-weight: 800; padding: 9px 26px; border-radius: 6px; cursor: pointer; letter-spacing: 0.5px; background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); box-shadow: 0 4px 14px rgba(59, 130, 246, 0.4); border: none; display: inline-flex; align-items: center; gap: 8px;',
+			'id': 'btn-start-speedtest', 'class': 'cbi-button cbi-button-action st-start',
 			'click': function(ev) {
 				ev.preventDefault();
-				var gwId = document.getElementById('st-gateway-select')?.value || 'cloudflare';
-				var szId = document.getElementById('st-size-select')?.value || 'standard';
-
+				if (self.engine === 'ookla') {
+					self.runOokla((document.getElementById('ookla-server') || {}).value || '');
+					return;
+				}
+				var gwId = gwSelect.value || 'cloudflare';
 				var gw = GATEWAYS.find(function(g) { return g.id === gwId; }) || GATEWAYS[0];
 				if (gwId === 'custom') {
 					gw = {
-						id: 'custom',
-						name: 'Custom Server',
-						location: 'Custom Target',
-						pingUrl: document.getElementById('st-custom-ping')?.value || '',
-						downUrl: document.getElementById('st-custom-down')?.value || '',
-						upUrl: document.getElementById('st-custom-up')?.value || ''
+						id: 'custom', name: _('Custom server'), location: _('Custom target'),
+						pingUrl: document.getElementById('st-custom-ping').value || '',
+						downUrl: document.getElementById('st-custom-down').value || '',
+						upUrl: document.getElementById('st-custom-up').value || ''
 					};
 				}
-
-				// Strict 1:1 Payload Sizes
-				var sizeConfig = { bytes: 10000000 }; // 10MB DL / 10MB UL
-				if (szId === 'fast') sizeConfig.bytes = 5000000; // 5MB DL / 5MB UL
-				else if (szId === 'deep') sizeConfig.bytes = 25000000; // 25MB DL / 25MB UL
-
-				self.runSpeedtest(gw, sizeConfig);
+				var bytes = { fast: 5000000, standard: 10000000, deep: 25000000 }[sizeSelect.value] || 10000000;
+				self.runSpeedtest(gw, { bytes: bytes });
 			}
-		}, [
-			dom.create('span', {}, '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>'),
-			_('START SPEEDTEST')
-		]);
+		}, _('Start'));
 
 		var btnStop = E('button', {
-			'id': 'btn-stop-speedtest',
-			'class': 'cbi-button cbi-button-reset',
-			'style': 'display: none; font-size: 13px; font-weight: 700; padding: 9px 18px; border-radius: 6px; cursor: pointer; background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.4);',
+			'id': 'btn-stop-speedtest', 'class': 'cbi-button cbi-button-reset st-stop', 'style': 'display: none;',
 			'click': function(ev) {
 				ev.preventDefault();
+				var wasOokla = self.ooklaRunning;
 				self.stopSpeedtest();
-				self.updateProgress(0, _('Benchmark Stopped by User'), '#ef4444');
-				self.setGaugeState('download', 'Stopped', '#ef4444');
-				self.setGaugeState('upload', 'Stopped', '#ef4444');
+				if (!wasOokla) self.updateProgress(0, _('Cancelled'), '#94a3b8');
+				self.setGaugeState('download', _('Stopped'), '#94a3b8');
+				self.setGaugeState('upload', _('Stopped'), '#94a3b8');
 			}
-		}, _('Cancel'));
+		}, _('Stop'));
 
 		var btnClearHist = E('button', {
-			'class': 'cbi-button cbi-button-neutral',
-			'style': 'font-size: 11px; padding: 4px 10px; border-radius: 4px; cursor: pointer;',
+			'class': 'cbi-button cbi-button-neutral', 'style': 'font-size: 11px; padding: 3px 10px;',
 			'click': function(ev) {
 				ev.preventDefault();
-				if (confirm(_('Clear all speedtest history records?'))) {
-					self.localHistory = [];
-					try {
-						localStorage.removeItem('modem_speedtest_history');
-					} catch(e) {}
-					self.renderHistoryTable([]);
-					callClearHistory();
-				}
+				if (!confirm(_('Clear the speedtest history?'))) return;
+				self.localHistory = [];
+				try { localStorage.removeItem('modem_speedtest_history'); } catch(e) {}
+				self.renderHistoryTable([]);
+				callClearHistory();
 			}
-		}, _('Clear History'));
+		}, _('Clear'));
 
-		// Main Layout Structure
+		var css = [
+			'.st-card { margin: 0 0 14px; padding: 16px 18px; border: 1px solid var(--border-color-medium); border-radius: 8px; }',
+			'.st-card h3 { margin: 0 0 12px; font-size: 13px; font-weight: 700; letter-spacing: .3px; }',
+			'.st-engines { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-bottom: 14px; }',
+			'.st-engine-tab { text-align: left; padding: 10px 14px; border-radius: 6px; cursor: pointer; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color-medium); color: inherit; display: flex; flex-direction: column; gap: 2px; }',
+			'.st-engine-tab:disabled { cursor: default; opacity: .6; }',
+			'.st-engine-active { border-color: #3b82f6; background: rgba(59,130,246,0.10); box-shadow: inset 0 0 0 1px #3b82f6; }',
+			'.st-engine-title { font-size: 13px; font-weight: 700; }',
+			'.st-engine-sub { font-size: 11px; color: var(--text-color-medium); }',
+			'.st-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; justify-content: space-between; }',
+			'.st-panel { flex: 1; min-width: 260px; }',
+			'.st-label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--text-color-medium); margin: 0 0 5px; }',
+			'.st-input { min-width: 240px; max-width: 100%; }',
+			'.st-hint { font-size: 11px; color: var(--text-color-medium); margin-top: 6px; }',
+			'.st-note { font-size: 12px; line-height: 1.5; color: var(--text-color-medium); margin-bottom: 10px; }',
+			'.st-accept { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; margin-bottom: 10px; }',
+			'.st-custom-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; margin-top: 8px; }',
+			'.st-actions { display: flex; gap: 8px; }',
+			'.st-start { min-width: 140px; padding: 9px 28px !important; font-size: 14px !important; font-weight: 700 !important; }',
+			'.st-stop { padding: 9px 18px !important; }',
+			'.st-progress-row { display: flex; justify-content: space-between; font-size: 12px; margin: 14px 0 6px; }',
+			'.st-meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--text-color-medium); margin: -4px 0 14px; }',
+			'.st-meta:empty { display: none; }',
+			'.st-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 14px; }',
+			'.st-grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 14px; }'
+		].join('\n');
+
 		var viewRoot = E('div', { 'class': 'cbi-map', 'style': 'padding-bottom: 30px;' }, [
-			// 1. Header Toolbar
-			E('div', {
-				'style': 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; border-bottom: 1px solid var(--border-color-medium); padding-bottom: 12px;'
-			}, [
-				E('div', {}, [
-					E('h2', { 'style': 'margin: 0 0 4px; font-size: 18px; font-weight: bold;' }, _('4G LTE Gateway Speedtest & Latency Analyzer')),
-					E('div', { 'style': 'font-size: 12px; color: var(--text-color-medium);' }, 
-						_('Strict 1:1 Download & Upload payload benchmarking, ping latency, jitter variance, and Qualcomm radio telemetry.')
-					)
+			E('style', {}, css),
+
+			// Header
+			E('div', { 'style': 'margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-color-medium);' }, [
+				E('h2', { 'style': 'margin: 0 0 4px; font-size: 18px; font-weight: 700;' }, _('Speedtest')),
+				E('div', { 'style': 'font-size: 12px; color: var(--text-color-medium);' },
+					_('Measure the cellular connection from the router with Speedtest by Ookla, or from this browser.'))
+			]),
+
+			// Controls
+			E('div', { 'class': 'cbi-section rf-cockpit-card st-card' }, [
+				E('div', { 'class': 'st-engines' }, [
+					engineTab('ookla', _('Speedtest by Ookla'), _('Runs on the router · nearest Ookla server')),
+					engineTab('browser', _('Browser test'), _('This device → router → internet'))
 				]),
-				E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
-					E('span', {
-						'class': 'badge',
-						'style': 'font-size: 11px; padding: 4px 10px; border-radius: 4px; background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.3); font-family: monospace;'
-					}, 'Interface: wwan0 (4G LTE)')
-				])
-			]),
-
-			// 2a. Speedtest by Ookla (router-side)
-			E('div', {
-				'class': 'cbi-section rf-cockpit-card',
-				'style': 'margin-bottom: 16px; padding: 16px 20px; border: 1px solid var(--border-color-medium); border-radius: 8px;'
-			}, [
-				E('h3', { 'style': 'margin: 0 0 8px; font-size: 14px; font-weight: bold;' }, _('Speedtest by Ookla (runs on the router)')),
-				E('div', { 'id': 'ookla-card-body' }, '--')
-			]),
-
-			// 2b. Browser test card (this device -> router -> internet)
-			E('div', {
-				'class': 'cbi-section rf-cockpit-card',
-				'style': 'margin-bottom: 16px; padding: 16px 20px; background: rgba(255,255,255,0.02); border: 1px solid var(--border-color-medium); border-radius: 8px;'
-			}, [
-				E('div', { 'style': 'display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 14px;' }, [
-					E('div', { 'style': 'flex: 1; min-width: 280px;' }, [
-						E('label', { 'style': 'display: block; font-weight: 700; font-size: 13px; margin-bottom: 6px;' }, _('Browser test (this device → router → internet), server:')),
-						gwSelect,
+				E('div', { 'class': 'st-controls' }, [
+					E('div', { 'class': 'st-panel', 'id': 'st-panel-ookla' }, '--'),
+					E('div', { 'class': 'st-panel', 'id': 'st-panel-browser', 'style': 'display: none;' }, [
+						E('div', { 'style': 'display: flex; flex-wrap: wrap; gap: 12px;' }, [
+							E('div', {}, [ E('label', { 'class': 'st-label' }, _('Server')), gwSelect ]),
+							E('div', {}, [ E('label', { 'class': 'st-label' }, _('Data size')), sizeSelect ])
+						]),
 						customGwBox
 					]),
-					E('div', { 'style': 'min-width: 240px;' }, [
-						E('label', { 'style': 'display: block; font-weight: 700; font-size: 13px; margin-bottom: 6px;' }, _('Test Payload (1:1 Ratio):')),
-						sizeSelect
-					]),
-					E('div', { 'style': 'display: flex; align-items: center; gap: 10px;' }, [
-						btnStart,
-						btnStop
-					])
+					E('div', { 'class': 'st-actions' }, [ btnStart, btnStop ])
 				]),
-
-				// Progress Strip
-				E('div', { 'style': 'margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.06);' }, [
-					E('div', { 'style': 'display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px;' }, [
-						E('span', { 'id': 'st-step-label', 'style': 'font-weight: 600; color: #38bdf8;' }, _('Ready to Benchmark (Download first, then 1:1 Upload)')),
-						E('span', { 'id': 'st-progress-pct', 'style': 'font-family: monospace; font-weight: bold;' }, '0%')
-					]),
-					E('div', { 'style': 'width: 100%; height: 6px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden;' }, [
-						E('div', {
-							'id': 'st-progress-bar',
-							'style': 'width: 0%; height: 100%; background: #38bdf8; border-radius: 3px; transition: width 0.25s ease;'
-						})
-					])
+				E('div', { 'class': 'st-progress-row' }, [
+					E('span', { 'id': 'st-step-label', 'style': 'font-weight: 600;' }, _('Ready')),
+					E('span', { 'id': 'st-progress-pct', 'style': 'font-family: monospace;' }, '0%')
+				]),
+				E('div', { 'style': 'width: 100%; height: 5px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden;' }, [
+					E('div', { 'id': 'st-progress-bar', 'style': 'width: 0%; height: 100%; background: #38bdf8; border-radius: 3px; transition: width 0.25s ease;' })
 				])
 			]),
 
-			// 3. Hero Speedometer Gauges (Download & Upload)
-			E('div', {
-				'class': 'rf-cockpit-grid',
-				'style': 'display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 16px;'
-			}, [
-				// Download Gauge Card
-				E('div', {
-					'class': 'cbi-section rf-cockpit-card',
-					'style': 'margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: radial-gradient(circle at center, rgba(56,189,248,0.06) 0%, rgba(255,255,255,0.01) 70%); border: 1px solid var(--border-color-medium); border-radius: 8px;'
-				}, [
-					createDialGaugeSvg(_('Download Speed'), 'st-dl-dial', 'st-dl-val', 'st-dl-peak', 'st-dl-state-badge', 100, 'Mbps', '#38bdf8')
+			// Gauges
+			E('div', { 'class': 'st-grid-2' }, [
+				E('div', { 'class': 'cbi-section rf-cockpit-card st-card', 'style': 'margin: 0; display: flex; justify-content: center;' }, [
+					createDialGaugeSvg(_('Download'), 'st-dl-dial', 'st-dl-val', 'st-dl-peak', 'st-dl-state-badge', 100, 'Mbps', '#38bdf8')
 				]),
-
-				// Upload Gauge Card
-				E('div', {
-					'class': 'cbi-section rf-cockpit-card',
-					'style': 'margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: radial-gradient(circle at center, rgba(52,211,153,0.06) 0%, rgba(255,255,255,0.01) 70%); border: 1px solid var(--border-color-medium); border-radius: 8px;'
-				}, [
-					createDialGaugeSvg(_('Upload Speed'), 'st-ul-dial', 'st-ul-val', 'st-ul-peak', 'st-ul-state-badge', 50, 'Mbps', '#34d399')
+				E('div', { 'class': 'cbi-section rf-cockpit-card st-card', 'style': 'margin: 0; display: flex; justify-content: center;' }, [
+					createDialGaugeSvg(_('Upload'), 'st-ul-dial', 'st-ul-val', 'st-ul-peak', 'st-ul-state-badge', 50, 'Mbps', '#34d399')
 				])
 			]),
+			E('div', { 'class': 'st-meta', 'id': 'st-result-meta' }),
 
-			// 4. Detailed Diagnostic Metric Cards (Ping, Jitter, Packet Loss, Radio Band)
-			E('div', {
-				'class': 'rf-cockpit-grid',
-				'style': 'display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px;'
-			}, [
-				createMetricCard(_('Latency (Ping)'), 'st-ping-val', 'st-ping-sub', 'st-ping-badge', '--', 'Min: -- | Max: -- ms', '#38bdf8'),
-				createMetricCard(_('Jitter Variance'), 'st-jitter-val', 'st-jitter-sub', 'st-jitter-badge', '--', 'RFC 3550 Variance', '#a78bfa'),
-				createMetricCard(_('Packet Loss'), 'st-loss-val', 'st-loss-sub', 'st-loss-badge', '0%', '100% Packets Received', '#10b981'),
-				createMetricCard(_('Serving Radio & Tower'), 'st-radio-val', 'st-radio-sub', 'st-radio-badge', (initialSig && initialSig.serving && initialSig.serving.band) || '--', '--', '#f59e0b')
+			// Metrics
+			E('div', { 'class': 'st-grid-4' }, [
+				createMetricCard(_('Latency'), 'st-ping-val', 'st-ping-sub', 'st-ping-badge', '--', '--', '#38bdf8'),
+				createMetricCard(_('Jitter'), 'st-jitter-val', 'st-jitter-sub', 'st-jitter-badge', '--', _('Variation between pings'), '#a78bfa'),
+				createMetricCard(_('Packet loss'), 'st-loss-val', 'st-loss-sub', 'st-loss-badge', '--', '--', '#10b981'),
+				createMetricCard(_('Network'), 'st-radio-val', 'st-radio-sub', 'st-radio-badge', '--', '--', '#f59e0b')
 			]),
 
-			// 5. Dual Full-Timeline Waveform Canvas (Both curves visible from start to finish!)
-			E('div', {
-				'class': 'cbi-section rf-cockpit-card',
-				'style': 'margin-bottom: 16px; padding: 16px 20px; border: 1px solid var(--border-color-medium); border-radius: 8px;'
-			}, [
-				E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;' }, [
-					E('h3', { 'style': 'margin: 0; font-size: 14px; font-weight: bold;' }, _('Live Bandwidth Stream Waveform (Full 1:1 Timeline)')),
+			// Throughput chart
+			E('div', { 'class': 'cbi-section rf-cockpit-card st-card' }, [
+				E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;' }, [
+					E('h3', { 'style': 'margin: 0;' }, _('Throughput')),
 					E('div', { 'style': 'display: flex; gap: 14px; font-size: 11px;' }, [
-						E('span', { 'style': 'color: #38bdf8; font-weight: 600;' }, '● 1. Download Stream (Left)'),
-						E('span', { 'style': 'color: #34d399; font-weight: 600;' }, '● 2. Upload Stream (Right)')
+						E('span', { 'style': 'color: #38bdf8;' }, '● ' + _('Download')),
+						E('span', { 'style': 'color: #34d399;' }, '● ' + _('Upload'))
 					])
 				]),
-				E('div', {
-					'style': 'width: 100%; height: 160px; background: rgba(0,0,0,0.28); border: 1px solid var(--border-color-medium); border-radius: 6px; overflow: hidden;'
-				}, [
+				E('div', { 'style': 'width: 100%; height: 150px; background: rgba(0,0,0,0.22); border: 1px solid var(--border-color-medium); border-radius: 6px; overflow: hidden;' }, [
 					E('canvas', { 'id': 'st-waveform-canvas', 'style': 'width: 100%; height: 100%; display: block;' })
 				])
 			]),
 
-			// 6. Speedtest History Table
-			E('div', {
-				'class': 'cbi-section rf-cockpit-card',
-				'style': 'margin: 0; padding: 16px 20px; border: 1px solid var(--border-color-medium); border-radius: 8px;'
-			}, [
-				E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;' }, [
-					E('h3', { 'style': 'margin: 0; font-size: 14px; font-weight: bold;' }, _('Speedtest Analysis History Log')),
+			// History
+			E('div', { 'class': 'cbi-section rf-cockpit-card st-card', 'style': 'margin: 0;' }, [
+				E('div', { 'style': 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;' }, [
+					E('h3', { 'style': 'margin: 0;' }, _('History')),
 					btnClearHist
 				]),
-				E('table', { 'class': 'table', 'style': 'margin: 0; font-size: 12px;' }, [
-					E('thead', {}, [
-						E('tr', {}, [
-							E('th', {}, _('Timestamp')),
-							E('th', {}, _('Gateway / Server')),
-							E('th', {}, _('Band')),
-							E('th', {}, _('Ping (Avg)')),
-							E('th', {}, _('Jitter')),
-							E('th', {}, _('Loss')),
-							E('th', {}, _('Download')),
-							E('th', {}, _('Upload'))
-						])
-					]),
-					E('tbody', { 'id': 'speedtest-history-body' })
+				E('div', { 'style': 'overflow-x: auto;' }, [
+					E('table', { 'class': 'table', 'style': 'margin: 0; font-size: 12px;' }, [
+						E('thead', {}, [
+							E('tr', {}, [
+								E('th', {}, _('Time')),
+								E('th', {}, _('Server')),
+								E('th', {}, _('Network')),
+								E('th', {}, _('Ping')),
+								E('th', {}, _('Jitter')),
+								E('th', {}, _('Loss')),
+								E('th', {}, _('Download')),
+								E('th', {}, _('Upload'))
+							])
+						]),
+						E('tbody', { 'id': 'speedtest-history-body' })
+					])
 				])
 			])
 		]);
 
-		var ooklaInitial = (loadData && loadData[2]) ? loadData[2] : {};
 		setTimeout(function() {
-			if (self.localHistory) self.renderHistoryTable(self.localHistory);
-			self.renderOoklaCard(ooklaInitial);
+			self.renderHistoryTable(self.localHistory);
+			self.renderOoklaPanel(ooklaInitial);
+			self.selectEngine(startEngine);
+			self.setNetworkCard(initialSig);
+			self.setGaugeState('download', _('Idle'), '#94a3b8');
+			self.setGaugeState('upload', _('Idle'), '#94a3b8');
 			if (ooklaInitial.installing) self.pollOoklaInstall();
-		}, 80);
+		}, 60);
 
 		return viewRoot;
 	},
