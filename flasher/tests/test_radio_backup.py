@@ -103,7 +103,7 @@ class RadioBackupTest(unittest.TestCase):
     def test_no_serial_in_firehose_mode_fails_cleanly(self):
         self.backup()                      # session already past Sahara
         r = self.backup("--keep-duplicate")
-        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.returncode, 4)  # EXIT_NOSERIAL: caller reboots the dongle
         self.assertIn("serial", r.stderr)
         self.assertEqual(r.stdout.strip(), "")
         self.assertFalse([d for d in os.listdir(self.root) if d.startswith(".staging")])
