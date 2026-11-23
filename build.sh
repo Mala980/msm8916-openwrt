@@ -484,6 +484,17 @@ sync_bsp() {
         fi
     "
 
+    # A tree once copied from exFAT keeps rwx------ modes, which $(CP)-installed
+    # package files carry into the firmware (hostapd could not read its own
+    # scripts -> no Wi-Fi). Restore normal modes from the git index.
+    local fixed
+    fixed=$(docker_exec bash "$CONTAINER_REPO_DIR/scripts/fix-tree-perms.sh" "$CONTAINER_OPENWRT_DIR" | grep -E '^[0-9]+$' | tail -n 1)
+    if [ "${fixed:-0}" -gt 0 ] 2>/dev/null; then
+        warn "Restored normal permissions on $fixed files in the OpenWrt tree."
+        warn "Packages built from them still carry the old modes: rebuild with './build.sh rebuild <board>'"
+        warn "or clean the affected packages (see check_rootfs_perms after the build)."
+    fi
+
     # Assert the sync actually landed. A partial or failed copy would otherwise
     # build a kernel from the wrong patch set without any error.
     assert_bsp_synced
@@ -823,6 +834,28 @@ build_target() {
     fi
 
     run_openwrt_make "make -j\$(($(nproc)+1)) V=sc"
+
+    check_rootfs_perms
+}
+
+# Files in the image that other users cannot read break services that run as
+# an unprivileged user (hostapd, dnsmasq, ...). Only /etc/shadow and
+# /etc/ppp/chap-secrets are meant to be private.
+check_rootfs_perms() {
+    local bad
+    bad=$(docker_exec sh -c "
+        for root in $CONTAINER_OPENWRT_DIR/build_dir/target-*/root-*; do
+            [ -d \"\$root\" ] || continue
+            (cd \"\$root\" && find . -type f ! -perm -0004 ! -path ./etc/shadow ! -path ./etc/ppp/chap-secrets)
+        done
+    " | grep '^\./' | sed 's#^\./#/#')
+    if [ -n "$bad" ]; then
+        warn "The image contains $(printf '%s\n' "$bad" | wc -l | tr -d ' ') files other users cannot read:"
+        printf '%s\n' "$bad" | head -n 20 | sed 's/^/      /'
+        warn "Services running as non-root (hostapd, dnsmasq, ...) may fail. Clean and rebuild the packages that own them."
+    else
+        ok "Image file permissions OK."
+    fi
 }
 
 ###############################################################################
