@@ -84,6 +84,25 @@ class RadioBackupTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.root, "0x242efec7", "unit.json")))
         self.assertEqual(self.run_tool("verify", dest).returncode, 0)
 
+    def test_parts_unique_alias(self):
+        r = self.backup("--parts", "unique")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dest = r.stdout.strip()
+        bins = sorted(f for f in os.listdir(dest) if f.endswith(".bin"))
+        self.assertEqual(bins, sorted(p + ".bin" for p in
+                                      ["fsc", "fsg", "modemst1", "modemst2", "persist", "sec", "DDR", "ssd"]))
+
+    def test_identity_json_saved(self):
+        ident = os.path.join(self.tmp.name, "ident.json")
+        with open(ident, "w") as f:
+            json.dump({"imei": "860018046041589", "version": "V2.3.15.1"}, f)
+        r = self.backup("--parts", "unique", "--identity", ident)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dest = r.stdout.strip()
+        with open(os.path.join(dest, "identity.json")) as f:
+            self.assertEqual(json.load(f), {"imei": "860018046041589", "version": "V2.3.15.1"})
+        self.assertEqual(self.run_tool("verify", dest).returncode, 0)
+
     def test_unchanged_backup_is_not_duplicated(self):
         first = self.backup().stdout.strip()
         self.new_session()
