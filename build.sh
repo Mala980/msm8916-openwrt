@@ -849,7 +849,7 @@ build_target() {
         # build variants. Drop those build dirs and build once more.
         purge_bad_perm_pkgdirs
         run_openwrt_make "make -j\$(($(nproc)+1)) V=sc"
-        check_rootfs_perms || warn "Some image files are still unreadable by non-root users (see above)."
+        check_rootfs_perms || warn "Some image files still have rwx------ modes (see above)."
     fi
 }
 
@@ -861,8 +861,7 @@ purge_bad_perm_pkgdirs() {
         cd $CONTAINER_OPENWRT_DIR/build_dir || exit 0
         for d in target-*/*/; do
             case \"\$d\" in */root-*/|*/linux-*/|*/toolchain*/) continue ;; esac
-            bad=\$(find \"\$d\" \\( -path '*/ipkg-*' -o -path '*/.pkgdir/*' \\) -type f ! -perm -0004 \\
-                ! -path '*/etc/shadow' ! -path '*/etc/ppp/chap-secrets' 2>/dev/null | head -n 1)
+            bad=\$(find \"\$d\" \\( -path '*/ipkg-*' -o -path '*/.pkgdir/*' \\) -type f -perm 700 2>/dev/null | head -n 1)
             [ -n \"\$bad\" ] && echo \"PKGDIR \${d%/}\"
         done
     " | sed -n 's/^PKGDIR //p')
@@ -874,19 +873,20 @@ purge_bad_perm_pkgdirs() {
     done
 }
 
-# Files in the image that other users cannot read break services that run as
-# an unprivileged user (hostapd, dnsmasq, ...). Only /etc/shadow and
-# /etc/ppp/chap-secrets are meant to be private.
+# rwx------ files in the image are the fingerprint of a tree that was copied
+# from exFAT; they break services running as an unprivileged user (hostapd
+# could not read its own scripts). 0600 is not flagged: OpenWrt installs
+# config files that way on purpose (INSTALL_CONF := install -m0600).
 check_rootfs_perms() {
     local bad
     bad=$(docker_exec sh -c "
         for root in $CONTAINER_OPENWRT_DIR/build_dir/target-*/root-*; do
             [ -d \"\$root\" ] || continue
-            (cd \"\$root\" && find . -type f ! -perm -0004 ! -path ./etc/shadow ! -path ./etc/ppp/chap-secrets)
+            (cd \"\$root\" && find . -type f -perm 700)
         done
     " | grep '^\./' | sed 's#^\./#/#')
     if [ -n "$bad" ]; then
-        warn "The image contains $(printf '%s\n' "$bad" | wc -l | tr -d ' ') files other users cannot read:"
+        warn "The image contains $(printf '%s\n' "$bad" | wc -l | tr -d ' ') rwx------ files (exFAT modes):"
         printf '%s\n' "$bad" | head -n 20 | sed 's/^/      /'
         warn "Services running as non-root (hostapd, dnsmasq, ...) may fail."
         return 1
