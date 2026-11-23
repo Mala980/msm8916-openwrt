@@ -392,8 +392,10 @@ The image in `firmware/` consists of the following files:
 | After restore, the dongle cycles and does not boot | The service partitions were not reformatted. Re-run `./restore-stock.sh`. |
 | Modem status pages are empty right after boot | ModemManager needs 20–50 seconds to enumerate the modem after start. Wait, then reload the page. |
 
-Every run of `backup-stock.sh`, `flash-firmware.sh` and `restore-stock.sh` is also
-written to `logs/<script>-<timestamp>.log` (git-ignored) for later inspection.
+Every run of `backup-stock.sh` and `restore-stock.sh` is also written to
+`logs/<script>-<timestamp>.log` (git-ignored) for later inspection.
+`flash-firmware.sh` writes no log: it prints one line per step and shows edl's
+last output lines only when a step fails.
 
 ---
 

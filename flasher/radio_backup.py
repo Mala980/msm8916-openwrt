@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,13 +95,29 @@ def parse_sahara(text):
 
 
 def run_edl(edl, args):
-    """Run edl, echo its output (so wrapper logs keep it), return (rc, text)."""
+    """Run edl quietly, return (rc, text). Callers show edl_tail() on failure."""
     proc = subprocess.run([edl] + args, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, universal_newlines=True,
                           errors="replace")
-    sys.stderr.write(proc.stdout)
-    sys.stderr.flush()
     return proc.returncode, proc.stdout
+
+
+def edl_tail(text, n=20):
+    """Print edl's last meaningful lines (no progress-bar frames)."""
+    lines = [l for l in text.replace("\r", "\n").splitlines()
+             if l.strip() and "Progress:" not in l and not l.startswith("Done |")]
+    for line in lines[-n:]:
+        print("      " + line, file=sys.stderr)
+    sys.stderr.flush()
+
+
+def progress(msg, done=False):
+    """One self-updating line on a terminal, plain lines otherwise."""
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K[*] " + msg + ("\n" if done else ""))
+        sys.stderr.flush()
+    elif done:
+        log(msg)
 
 
 def load_json(path):
@@ -203,16 +220,21 @@ def cmd_backup(a):
     identity = {}
     src = {}
     try:
+        started = time.time()
         for i, part in enumerate(parts):
             out = os.path.join(staging, part + ".bin")
-            log("Reading %s (%d/%d)…" % (part, i + 1, len(parts)))
+            progress("Backing up this unit's radio partitions… %s (%d/%d)" % (part, i + 1, len(parts)))
             rc, text = run_edl(edl, ["r", part, out])
             if i == 0:
                 identity = parse_sahara(text)
             if rc != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
+                progress("Backing up this unit's radio partitions… %s failed" % part, done=True)
+                edl_tail(text)
                 warn("read of %s failed (edl rc=%d)" % (part, rc))
                 return EXIT_ERR
             src[part] = out
+        progress("Backing up this unit's radio partitions… %d/%d ✓ %ds"
+                 % (len(parts), len(parts), time.time() - started), done=True)
 
         serial = a.serial or identity.get("serial")
         if not serial:

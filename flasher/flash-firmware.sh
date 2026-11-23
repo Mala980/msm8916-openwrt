@@ -10,12 +10,14 @@
 #
 # Reads images from ./firmware/. Run backup-stock.sh FIRST on a new dongle.
 # Any missing tool (edl, python, adb) is installed into ./temp automatically.
+#
+# Output: one line per step. edl's own output (banners, progress bars) is kept
+# off the screen and only shown -- its last lines -- when a step fails. No log
+# file is written.
 # ===========================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p logs   # tee this run to ./logs/<script>-<timestamp>.log and the terminal
-trap '' HUP PIPE
-exec > >(tee -a "logs/$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log") 2>&1
+trap '' HUP
 
 # ===== self-contained tooling — everything installs into ./temp (gitignored) =====
 TEMP_DIR="$PWD/temp"
@@ -25,6 +27,35 @@ warn() { printf '%s[!]%s %s\n' "$c_y" "$c_0" "$*"; }
 die()  { printf '%s[-]%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
 hms()  { printf '%dh %02dm %02ds' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }   # seconds -> H M S
 PY=""; ADB=""; EDL="${EDL_BIN:-}"
+
+# Run one edl command as a single tidy step: "[*] <label> … 12s" with a spinner
+# on a terminal, then "✓" or, on failure, edl's last 20 lines. Returns edl's
+# exit status (callers decide whether it is fatal).
+edl_step() {
+    local label="$1"; shift
+    local out rc=0 start=$SECONDS pid spin='|/-\' i=0
+    out="$(mktemp)"
+    if [[ -t 1 ]]; then
+        "$EDL" "$@" >"$out" 2>&1 &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r%s[*]%s %s %s %ds ' "$c_g" "$c_0" "$label" "${spin:i++%4:1}" $((SECONDS - start))
+            sleep 0.2
+        done
+        wait "$pid" || rc=$?
+        printf '\r\033[K'
+    else
+        "$EDL" "$@" >"$out" 2>&1 || rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+        printf '%s[*]%s %s %s✓%s %ds\n' "$c_g" "$c_0" "$label" "$c_g" "$c_0" $((SECONDS - start))
+    else
+        printf '%s[-]%s %s failed (edl exit %d). Last edl output:\n' "$c_r" "$c_0" "$label" "$rc"
+        { tr '\r' '\n' <"$out" | grep -vE '^[[:space:]]*$|Progress:|^Done \|' | tail -n 20 | sed 's/^/      /'; } || true
+    fi
+    rm -f "$out"
+    return "$rc"
+}
 
 # python3: system one, else a standalone build downloaded into ./temp/python
 ensure_python() {
@@ -293,11 +324,9 @@ enter_edl
 # Always save this unit's live radio + boot chain permanently FIRST, filed by
 # chip serial (backup/units/<serial>/<timestamp>/). It must be the first edl
 # call of the session: only then does edl report the serial.
-log "Backing up this unit's radio partitions (filed by chip serial)…"
 LIVE="$("$PY" -I radio_backup.py backup --edl "$EDL" --print-path)" \
     || die "radio backup failed — nothing has been written to the dongle"
 [[ -d "$LIVE" ]] || die "radio backup returned no folder — nothing has been written to the dongle"
-log "This unit's backup: $LIVE"
 
 SAVED=""
 if [[ "$RADIO_SRC" == "2" ]]; then
@@ -312,7 +341,7 @@ if [[ "$RADIO_SRC" == "2" ]]; then
         read -r -p "Type YES to restore it anyway: " c
         if [[ "$c" != "YES" ]]; then
             log "Cancelled — nothing written. This unit's own backup: $LIVE"
-            "$EDL" reset || warn "edl reset failed — power-cycle the dongle manually"
+            edl_step "Rebooting the dongle" reset || warn "edl reset failed — power-cycle the dongle manually"
             exit 0
         fi
     fi
@@ -322,35 +351,33 @@ else
     SAVED="$LIVE"
 fi
 
-log "Flashing GPT (raw sector writes)…"
 GPTTMP="$(mktemp -d)"
 dd if="$GPT" bs=512 count=34         of="$GPTTMP/primary.bin"        2>/dev/null
 dd if="$GPT" bs=512 skip=34 count=32 of="$GPTTMP/backup_entries.bin" 2>/dev/null
 dd if="$GPT" bs=512 skip=66 count=1  of="$GPTTMP/backup_header.bin"  2>/dev/null
-"$EDL" ws 0                     "$GPTTMP/primary.bin"        || die "GPT primary write failed"
-"$EDL" ws $((TOT_SECTORS-33))   "$GPTTMP/backup_entries.bin" || die "GPT backup-entries write failed"
-"$EDL" ws $((TOT_SECTORS-1))    "$GPTTMP/backup_header.bin"  || die "GPT backup-header write failed"
+edl_step "Writing GPT (primary)"        ws 0                   "$GPTTMP/primary.bin"        || die "GPT primary write failed"
+edl_step "Writing GPT (backup entries)" ws $((TOT_SECTORS-33)) "$GPTTMP/backup_entries.bin" || die "GPT backup-entries write failed"
+edl_step "Writing GPT (backup header)"  ws $((TOT_SECTORS-1))  "$GPTTMP/backup_header.bin"  || die "GPT backup-header write failed"
 
-log "Flashing firmware + OpenWrt images…"
-"$EDL" w aboot  "$MBN/aboot.mbn" || die "aboot"
-"$EDL" w hyp    "$MBN/hyp.mbn"   || die "hyp"
-"$EDL" w rpm    "$MBN/rpm.mbn"   || die "rpm"
-"$EDL" w sbl1   "$MBN/sbl1.mbn"  || die "sbl1"
-"$EDL" w tz     "$MBN/tz.mbn"    || die "tz"
-"$EDL" w boot   "$BOOT"          || die "boot"
-"$EDL" w rootfs "$ROOTFS"        || die "rootfs"
-log "Wiping rootfs_data overlay header (clean overlay)..."
+mb() { echo "$(( ($(wc -c <"$1") + 524288) / 1048576 )) MB"; }
+edl_step "Writing aboot"                  w aboot  "$MBN/aboot.mbn" || die "aboot write failed"
+edl_step "Writing hyp"                    w hyp    "$MBN/hyp.mbn"   || die "hyp write failed"
+edl_step "Writing rpm"                    w rpm    "$MBN/rpm.mbn"   || die "rpm write failed"
+edl_step "Writing sbl1"                   w sbl1   "$MBN/sbl1.mbn"  || die "sbl1 write failed"
+edl_step "Writing tz"                     w tz     "$MBN/tz.mbn"    || die "tz write failed"
+edl_step "Writing boot ($(mb "$BOOT"))"     w boot   "$BOOT"          || die "boot write failed"
+edl_step "Writing rootfs ($(mb "$ROOTFS"))" w rootfs "$ROOTFS"        || die "rootfs write failed"
 ZEROS="$(mktemp)"
 dd if=/dev/zero of="$ZEROS" bs=1M count=32 status=none 2>/dev/null || dd if=/dev/zero of="$ZEROS" bs=512 count=65536 status=none 2>/dev/null || true
-"$EDL" ws 610338 "$ZEROS" 2>/dev/null || warn "wiping rootfs_data header returned non-zero"
+edl_step "Clearing the settings overlay" ws 610338 "$ZEROS" || warn "clearing the overlay header returned non-zero"
 rm -f "$ZEROS"
 
-log "Restoring radio partitions…"
-for n in $RADIO; do log "  write $n"; "$EDL" w "$n" "$SAVED/$n.bin" || die "restore of $n failed"; done
+for n in $RADIO; do
+    edl_step "Restoring radio partition $n" w "$n" "$SAVED/$n.bin" || die "restore of $n failed"
+done
 
-log "Rebooting…"
-"$EDL" reset || warn "edl reset failed — power-cycle the dongle manually"
+edl_step "Rebooting the dongle" reset || warn "edl reset failed — power-cycle the dongle manually"
 
 echo
 log "Flash complete in $(hms $SECONDS). The dongle boots OpenWrt with default config."
-log "Access: http://192.168.1.1 over the USB gadget (DHCP hands out 192.168.1.x)."
+log "Access: http://192.168.8.1 over the USB gadget (DHCP hands out 192.168.8.x)."
