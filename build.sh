@@ -843,7 +843,35 @@ build_target() {
 
     run_openwrt_make "make -j\$(($(nproc)+1)) V=sc"
 
-    check_rootfs_perms
+    if ! check_rootfs_perms; then
+        # Packages built before their sources' modes were fixed keep the old
+        # modes in their build dirs, and "make package/<x>/clean" misses
+        # build variants. Drop those build dirs and build once more.
+        purge_bad_perm_pkgdirs
+        run_openwrt_make "make -j\$(($(nproc)+1)) V=sc"
+        check_rootfs_perms || warn "Some image files are still unreadable by non-root users (see above)."
+    fi
+}
+
+# Remove the build dirs of packages whose installed files other users cannot
+# read, so the next make rebuilds them from the (now normal) sources.
+purge_bad_perm_pkgdirs() {
+    local dirs
+    dirs=$(docker_exec sh -c "
+        cd $CONTAINER_OPENWRT_DIR/build_dir || exit 0
+        for d in target-*/*/; do
+            case \"\$d\" in */root-*/|*/linux-*/|*/toolchain*/) continue ;; esac
+            bad=\$(find \"\$d\" \\( -path '*/ipkg-*' -o -path '*/.pkgdir/*' \\) -type f ! -perm -0004 \\
+                ! -path '*/etc/shadow' ! -path '*/etc/ppp/chap-secrets' 2>/dev/null | head -n 1)
+            [ -n \"\$bad\" ] && echo \"PKGDIR \${d%/}\"
+        done
+    " | sed -n 's/^PKGDIR //p')
+    [ -n "$dirs" ] || return 0
+    warn "Rebuilding packages that still carry unreadable files:"
+    printf '%s\n' "$dirs" | sed 's/^/      /'
+    printf '%s\n' "$dirs" | while read -r d; do
+        docker_exec rm -rf "$CONTAINER_OPENWRT_DIR/build_dir/$d" >/dev/null
+    done
 }
 
 # Files in the image that other users cannot read break services that run as
@@ -860,10 +888,10 @@ check_rootfs_perms() {
     if [ -n "$bad" ]; then
         warn "The image contains $(printf '%s\n' "$bad" | wc -l | tr -d ' ') files other users cannot read:"
         printf '%s\n' "$bad" | head -n 20 | sed 's/^/      /'
-        warn "Services running as non-root (hostapd, dnsmasq, ...) may fail. Clean and rebuild the packages that own them."
-    else
-        ok "Image file permissions OK."
+        warn "Services running as non-root (hostapd, dnsmasq, ...) may fail."
+        return 1
     fi
+    ok "Image file permissions OK."
 }
 
 ###############################################################################
