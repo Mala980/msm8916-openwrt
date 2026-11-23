@@ -26,7 +26,10 @@ cat > "$BIN/mmcli" <<EOF
 echo "mmcli \$*" >> "$ROOT/calls"
 case "\$*" in
     *--sim=any*--output-keyvalue*) [ -s "$ROOT/sim" ] && cat "$ROOT/sim" || exit 1 ;;
-    *--output-keyvalue*) [ -s "$ROOT/op" ] && echo "modem.3gpp.operator-code : \$(cat "$ROOT/op")" || exit 1 ;;
+    *--output-keyvalue*)
+        if [ -s "$ROOT/modemkv" ]; then cat "$ROOT/modemkv"
+        elif [ -s "$ROOT/op" ]; then echo "modem.3gpp.operator-code : \$(cat "$ROOT/op")"
+        else exit 1; fi ;;
     *--3gpp-register-in-operator=*) [ -e "$ROOT/home_fail" ] && exit 1 || exit 0 ;;
     *--3gpp-register-home*) exit 0 ;;
 esac
@@ -35,6 +38,7 @@ chmod +x "$BIN/mmcli"
 
 {
     awk '/^modemmanager_set_plmn\(\)/,/^}/' "$PROTO"
+    awk '/^modemmanager_should_register\(\)/,/^}/' "$PROTO"
     awk '/^modemmanager_home_plmn\(\)/,/^}/' "$PROTO"
     awk '/^modemmanager_network_select\(\)/,/^}/' "$PROTO"
     awk '/^modemmanager_netselect_connected\(\)/,/^}/' "$PROTO"
@@ -50,11 +54,11 @@ EOF
 sim() { # sim <imsi> [operator-code]
     printf 'sim.dbus-path : /org/freedesktop/ModemManager1/SIM/0\nsim.properties.imsi : %s\nsim.properties.operator-code : %s\n' "$1" "${2:---}" > "$ROOT/sim"
 }
-reset() { rm -f "$ROOT/sim" "$ROOT/op" "$ROOT/home_fail" "$ROOT/calls" "$ROOT/mm-netselect-modem"; touch "$ROOT/calls"; }
+reset() { rm -f "$ROOT/sim" "$ROOT/op" "$ROOT/modemkv" "$ROOT/home_fail" "$ROOT/calls" "$ROOT/mm-netselect-modem"; touch "$ROOT/calls"; }
 STATE=$ROOT/mm-netselect-modem
 
 run() { # run <shell snippet>
-    NETSELECT_STATE_DIR=$ROOT PATH="$BIN:$PATH" sh -c ". '$ROOT/lib.sh'; . '$ROOT/funcs.sh'; $1" 2>&1
+    NETSELECT_BUSY_WAIT=0 NETSELECT_STATE_DIR=$ROOT PATH="$BIN:$PATH" sh -c ". '$ROOT/lib.sh'; . '$ROOT/funcs.sh'; $1" 2>&1
 }
 
 check() { name=$1; shift
@@ -140,6 +144,33 @@ check "connected on the home network (registered late) clears the count" [ ! -e 
 reset; echo "51001 3" > "$STATE"; echo 51011 > "$ROOT/op"
 run 'modemmanager_netselect_connected M modem' > /dev/null
 check "connected on another network keeps the count" [ "$(cat "$STATE")" = "51001 3" ]
+
+modemkv() { # modemkv <state> <reg-state> <operator-code>
+    printf 'modem.generic.state : %s\nmodem.3gpp.registration-state : %s\nmodem.3gpp.operator-code : %s\n' "$1" "$2" "$3" > "$ROOT/modemkv"
+}
+
+reset; sim 510011720015905; modemkv connected home 51001
+run 'modemmanager_network_select M modem home "" 1' > /dev/null
+check "home: already registered in 51001 -> no register request (no WrongState)" not_called "register-in-operator"
+
+reset; sim 510011720015905; modemkv connected home 51001
+run 'modemmanager_network_select M modem manual 51001 1; echo rc=$?' > "$ROOT/out"
+check "manual: already registered in the PLMN -> no request, no restart" \
+    sh -c "! grep -q -- 'register-in-operator' '$ROOT/calls' && ! grep -q notify_error '$ROOT/calls' && grep -q rc=0 '$ROOT/out'"
+
+reset; sim 510011720015905; modemkv disconnecting searching --
+run 'modemmanager_network_select M modem manual 51001 1; echo rc=$?' > "$ROOT/out"
+check "manual: stale bearer keeps modem 'disconnecting' -> skip, no restart loop" \
+    sh -c "! grep -q -- 'register-in-operator' '$ROOT/calls' && ! grep -q notify_error '$ROOT/calls' && grep -q rc=0 '$ROOT/out'"
+
+reset; sim 510011720015905; modemkv registered searching --
+run 'modemmanager_network_select M modem manual 51001 1' > /dev/null
+check "manual: modem idle and not registered -> registers in 51001" called "--3gpp-register-in-operator=51001"
+
+reset; sim 510011720015905; modemkv connected home 51011
+run 'modemmanager_network_select M modem manual 51001 1; echo rc=$?' > "$ROOT/out"
+check "manual: connected on another PLMN -> no WrongState request, no restart" \
+    sh -c "! grep -q -- 'register-in-operator' '$ROOT/calls' && ! grep -q notify_error '$ROOT/calls'"
 
 echo "netselect: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -159,6 +159,7 @@ PROBE_GAP=2
 # recovery ladder. See the note above verify_rx_connectivity().
 PROBE_FAIL_MIN=2
 PROBE_FAILS=0
+LAST_NOSVC_LOG=0
 
 verify_rx_connectivity() {
     local dns_server rx_pre rx_post attempt
@@ -540,6 +541,27 @@ while true; do
     fi
 
     if [ "$STALL_COUNT" -ge "$STALL_TIMEOUT" ]; then
+
+            # No service is not a stall: with the modem off the network (weak
+            # coverage, camped on a foreign cell for emergency-only service)
+            # there is nothing to recover, and tearing the bearer down leaves it
+            # stuck in "disconnecting", which then makes the proto's
+            # re-registration fail. Wait for the network to come back instead.
+            REG_STATE=$(mmcli -m any --output-keyvalue 2>/dev/null | sed -n 's/^modem\.3gpp\.registration-state *: *//p' | head -n 1)
+            case "$REG_STATE" in
+                home|roaming) ;;
+                *)
+                    NOW=$(date +%s)
+                    if [ $((NOW - LAST_NOSVC_LOG)) -ge 60 ]; then
+                        LAST_NOSVC_LOG="$NOW"
+                        logger -t modem-stall-watchdog "No service (registration: ${REG_STATE:-unknown}); waiting for the network instead of recovering the bearer."
+                    fi
+                    STALL_COUNT=0
+                    PROBE_FAILS=0
+                    sleep "$CHECK_INTERVAL"
+                    continue
+                    ;;
+            esac
 
             # Require the connectivity probe to fail PROBE_FAIL_MIN times in a row
             # before touching the bearer. A single failed probe is not evidence of

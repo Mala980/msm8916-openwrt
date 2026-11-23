@@ -590,6 +590,45 @@ modemmanager_home_plmn() {
 	esac
 }
 
+# Before asking for a registration: 0 = go ahead, 1 = skip it.
+# Skip when the modem is already registered in <plmn> (asking again is pointless
+# and fails with WrongState while a bearer is up), or when a stale bearer keeps
+# the modem "connected"/"disconnecting" after a short wait -- a register request
+# then fails with WrongState and, with force_connection, would restart the
+# interface in a loop. The connect step that follows deals with that case.
+modemmanager_should_register() {
+	local device="$1"
+	local plmn="$2"
+	local kv state reg op i=0
+
+	while :; do
+		kv="$(mmcli --modem="${device}" --output-keyvalue 2>/dev/null)"
+		state="$(echo "$kv" | sed -n 's/^modem\.generic\.state *: *//p' | head -n1)"
+		reg="$(echo "$kv" | sed -n 's/^modem\.3gpp\.registration-state *: *//p' | head -n1)"
+		op="$(echo "$kv" | sed -n 's/^modem\.3gpp\.operator-code *: *//p' | head -n1)"
+
+		case "$reg" in
+			home|roaming)
+				[ -n "$plmn" ] && [ "$op" = "$plmn" ] && {
+					echo "already registered in ${plmn} (${reg})"
+					return 1
+				}
+				;;
+		esac
+
+		case "$state" in
+			connected|connecting|disconnecting) ;;
+			*) return 0 ;;
+		esac
+		i=$((i + 1))
+		[ "$i" -gt "${NETSELECT_BUSY_WAIT:-10}" ] && break
+		sleep 2
+	done
+
+	echo "modem still '${state}' (stale bearer); skipping the registration request"
+	return 1
+}
+
 # Network selection, like a phone:
 #   home   (default) register only in the SIM's own network, so the modem does
 #          not sit on a stronger foreign cell for emergency-only service and
@@ -634,6 +673,7 @@ modemmanager_network_select() {
 					echo "home network ${home} failed ${fails} times in a row -> automatic selection"
 					netselect="auto"
 				else
+					modemmanager_should_register "$device" "$home" || return 0
 					echo "registering in the SIM's home network ${home}..."
 					if mmcli --modem="${device}" --timeout 90 \
 						--3gpp-register-in-operator="${home}" >/dev/null 2>&1; then
@@ -661,6 +701,7 @@ modemmanager_network_select() {
 	esac
 
 	if [ "$netselect" = "manual" ]; then
+		modemmanager_should_register "$device" "$plmn" || return 0
 		echo "starting network registration with plmn '${plmn}'..."
 		modemmanager_set_plmn "$device" "$interface" "$plmn" "$force_connection"
 		return $?
@@ -669,6 +710,7 @@ modemmanager_network_select() {
 	# The modem keeps a manual selection across restarts, so put it back to
 	# automatic explicitly. A failure here (no network yet) is not fatal: the
 	# connect step below waits for registration.
+	modemmanager_should_register "$device" "" || return 0
 	mmcli --modem="${device}" --timeout 30 --3gpp-register-home >/dev/null 2>&1 ||
 		echo "automatic network selection request failed (continuing)"
 	return 0
