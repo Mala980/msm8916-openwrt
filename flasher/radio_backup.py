@@ -51,7 +51,7 @@ SERIAL_RE = re.compile(r"Serial:\s*(0x[0-9a-fA-F]+)")
 HWID_RE = re.compile(r"HWID:\s*(0x[0-9a-fA-F]+)")
 PKHASH_RE = re.compile(r"PK_HASH:\s*(0x[0-9a-fA-F]+)")
 
-EXIT_OK, EXIT_ERR, EXIT_MISMATCH, EXIT_UNKNOWN = 0, 1, 2, 3
+EXIT_OK, EXIT_ERR, EXIT_MISMATCH, EXIT_UNKNOWN, EXIT_NOSERIAL = 0, 1, 2, 3, 4
 
 
 def log(msg):
@@ -96,14 +96,141 @@ def parse_sahara(text):
 
 PCT_RE = re.compile(r"(\d{1,3}\.\d+)%")
 SPEED_RE = re.compile(r"([\d.]+ [KMG]B/s)")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+WROTE_RE = re.compile(r"Wrote (\S+) to sector (\d+)")
+DUMPED_RE = re.compile(r"(Dumped .*)")
 DEBUG = os.environ.get("FLASH_DEBUG") == "1"
+
+# edl lines that are always printed but carry no information for a user
+EDL_NOISE = ("Keystone library", "Qualcomm Sahara", "Using loader", "Waiting for the device",
+             "Device detected", "[LIB]", "!DEBUG!", "Supported functions", "Protocol version",
+             "Trying to connect", "Trying to read first storage", "Running configure",
+             "Sector size in XML", "32-Bit mode", "Version 0x", "Uploading loader")
+
+
+class EdlView:
+    """Minimal-verbose rendering of edl's output: a few informative lines
+    (connection, chip, result), errors, and edl's own progress as one line
+    that updates in place. Everything else (banners, harmless warnings,
+    progress frames) is dropped. --debug bypasses this entirely."""
+
+    def __init__(self, out=None, indent="      ", connect_info=True):
+        self.out = out or sys.stdout
+        self.tty = self.out.isatty()
+        self.indent = indent
+        self.connect_info = connect_info
+        self.pending = ""
+        self.live = ""
+        self.last_progress = ""
+        self.said = set()
+        self.chip = {}
+        self.tail = []
+
+    def _clear_live(self):
+        if self.tty and self.live:
+            self.out.write("\r\033[K")
+        self.live = ""
+
+    def line(self, text):
+        self._clear_live()
+        self.out.write(self.indent + text + "\n")
+        self.out.flush()
+
+    def once(self, key, text):
+        if key not in self.said:
+            self.said.add(key)
+            self.line(text)
+
+    def _progress(self, seg):
+        m = PCT_RE.search(seg)
+        if not m:
+            return
+        sp = SPEED_RE.search(seg)
+        self.last_progress = m.group(1) + "%" + (("  " + sp.group(1)) if sp else "")
+        if self.tty:
+            self.live = self.last_progress
+            self.out.write("\r\033[K" + self.indent + self.live)
+            self.out.flush()
+
+    def _segment(self, raw):
+        s = ANSI_RE.sub("", raw).strip()
+        if not s:
+            return
+        self.tail = (self.tail + [s])[-20:]
+        w = WROTE_RE.search(s)
+        if "Progress:" in s:
+            self._progress(s)
+        if w:
+            self._finish_progress()
+            self.line("wrote %s → sector %s" % (os.path.basename(w.group(1)), w.group(2)))
+            return
+        if "Progress:" in s or s.startswith("Done |"):
+            return
+        low = s.lower()
+        if "usberror(5" in low:
+            self.once("disc", "dongle disconnected (rebooting)")
+            return
+        if any(k in low for k in ("error", "fail", "nak", "exception", "traceback", "timed out")) \
+                and "sector size in xml" not in low and "payload to target" not in low:
+            self.line("! " + s)
+            return
+        if any(n in s for n in EDL_NOISE):
+            return
+        m = re.search(r"Mode detected:\s*(\S+)", s)
+        if m and self.connect_info:
+            self.once("mode", "connected · %s mode" % m.group(1))
+            return
+        for key, rx in (("cpu", r'CPU detected:\s*"?([^"]+)"?'), ("serial", r"Serial:\s*(0x[0-9a-fA-F]+)"),
+                        ("hwid", r"HWID:\s*(0x[0-9a-fA-F]+)")):
+            m = re.search(rx, s)
+            if m:
+                self.chip[key] = m.group(1).strip()
+                if key == "serial":
+                    self.once("chip", "chip %s · serial %s · HWID %s" % (
+                        self.chip.get("cpu", "?"), self.chip["serial"], self.chip.get("hwid", "?")))
+                return
+        if "Loader successfully uploaded" in s:
+            self.once("loader", "loader uploaded, switching to firehose")
+            return
+        m = re.search(r"(TargetName|MemoryName)=(\S+)", s)
+        if m:
+            self.chip[m.group(1)] = m.group(2)
+            if "TargetName" in self.chip and "MemoryName" in self.chip:
+                self.once("target", "firehose ready · %s %s" % (self.chip["TargetName"], self.chip["MemoryName"]))
+            return
+        d = DUMPED_RE.search(s)
+        if d:
+            self.line(d.group(1))
+
+    def _finish_progress(self):
+        if self.last_progress:
+            self._clear_live()
+            self.out.write(self.indent + self.last_progress + "\n")
+            self.out.flush()
+            self.last_progress = ""
+
+    def feed(self, text):
+        self.pending += text
+        parts = re.split(r"[\r\n]", self.pending)
+        self.pending = parts.pop()
+        for seg in parts:
+            self._segment(seg)
+        # edl redraws its progress bar with \r and no newline: show it live
+        if "Progress:" in self.pending:
+            self._progress(self.pending)
+
+    def close(self):
+        if self.pending:
+            self._segment(self.pending)
+            self.pending = ""
+        self._finish_progress()
+        self._clear_live()
 
 
 def run_edl(edl, args, on_progress=None):
-    """Run edl, return (rc, text). Its output is read as it arrives so the
-    caller can show edl's own progress (on_progress(pct, speed)); with
-    FLASH_DEBUG=1 the raw output is also echoed. Callers show edl_tail() on
-    failure."""
+    """Run edl, return (rc, text). Output is read as it arrives so callers can
+    show edl's progress (on_progress(pct, speed)); with FLASH_DEBUG=1 the raw
+    output is echoed. Callers show edl_tail() on failure."""
     proc = subprocess.Popen([edl] + args, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
     chunks = []
@@ -128,24 +255,11 @@ def run_edl(edl, args, on_progress=None):
 
 def edl_tail(text, n=20):
     """Print edl's last meaningful lines (no progress-bar frames)."""
-    lines = [l for l in text.replace("\r", "\n").splitlines()
+    lines = [ANSI_RE.sub("", l) for l in text.replace("\r", "\n").splitlines()
              if l.strip() and "Progress:" not in l and not l.startswith("Done |")]
     for line in lines[-n:]:
         print("      " + line, file=sys.stderr)
     sys.stderr.flush()
-
-
-def progress(msg, done=False):
-    """One self-updating line on a terminal, plain lines otherwise."""
-    if DEBUG:
-        if done:
-            log(msg)
-        return
-    if sys.stderr.isatty():
-        sys.stderr.write("\r\033[K[*] " + msg + ("\n" if done else ""))
-        sys.stderr.flush()
-    elif done:
-        log(msg)
 
 
 def load_json(path):
@@ -249,31 +363,52 @@ def cmd_backup(a):
     src = {}
     try:
         started = time.time()
+        tty = sys.stderr.isatty()
+        log("Backing up this unit's radio partitions")
         for i, part in enumerate(parts):
             out = os.path.join(staging, part + ".bin")
-            label = "Backing up this unit's radio partitions… %s (%d/%d)" % (part, i + 1, len(parts))
-            progress(label)
+            name = "%-9s (%d/%d)" % (part, i + 1, len(parts))
+            t0 = time.time()
+            state = {"p": ""}
+
+            def show(pct, speed, name=name, state=state):
+                state["p"] = pct + (("  " + speed) if speed else "")
+                if tty and not DEBUG:
+                    sys.stderr.write("\r\033[K      %s  %s" % (name, state["p"]))
+                    sys.stderr.flush()
+
             if DEBUG:
-                log(label)
-            rc, text = run_edl(edl, ["r", part, out],
-                               lambda pct, speed, label=label: progress(
-                                   "%s  %s%s" % (label, pct, ("  " + speed) if speed else "")))
+                log("Reading " + part)
+            rc, text = run_edl(edl, ["r", part, out], show)
             if i == 0:
                 identity = parse_sahara(text)
-            if rc != 0 or not os.path.isfile(out) or os.path.getsize(out) == 0:
-                progress("Backing up this unit's radio partitions… %s failed" % part, done=True)
+                if identity.get("serial") and not DEBUG:
+                    if tty:
+                        sys.stderr.write("\r\033[K")
+                    cpu = re.search(r'CPU detected:\s*"?([^"\n]+)"?', text)
+                    print("      chip %s · serial %s · HWID %s" % (
+                        cpu.group(1).strip() if cpu else "?", identity["serial"],
+                        identity.get("hwid", "?")), file=sys.stderr)
+            ok = rc == 0 and os.path.isfile(out) and os.path.getsize(out) > 0
+            if not DEBUG:
+                if tty:
+                    sys.stderr.write("\r\033[K")
+                size = os.path.getsize(out) if os.path.isfile(out) else 0
+                print("      %s  %7.1f MB  %s %.1fs" % (
+                    name, size / 1048576.0, "✓" if ok else "✗ failed", time.time() - t0), file=sys.stderr)
+                sys.stderr.flush()
+            if not ok:
                 edl_tail(text)
                 warn("read of %s failed (edl rc=%d)" % (part, rc))
                 return EXIT_ERR
             src[part] = out
-        progress("Backing up this unit's radio partitions… %d/%d ✓ %ds"
-                 % (len(parts), len(parts), time.time() - started), done=True)
+        log("Radio backup done: %d partitions in %ds" % (len(parts), time.time() - started))
 
         serial = a.serial or identity.get("serial")
         if not serial:
-            warn("edl did not report the chip serial (the dongle was already in firehose "
-                 "mode). Replug it into EDL and retry, or pass --serial 0x....")
-            return EXIT_ERR
+            warn("edl did not report the chip serial: the dongle is still in firehose mode "
+                 "from an earlier, interrupted run.")
+            return EXIT_NOSERIAL
         if a.serial and identity.get("serial") and \
                 normalize_serial(a.serial) != normalize_serial(identity["serial"]):
             warn("--serial %s does not match the connected chip %s" % (a.serial, identity["serial"]))
@@ -375,6 +510,19 @@ def cmd_check(a):
     return EXIT_OK
 
 
+def cmd_view(a):
+    """Render edl output from stdin (used by flash-firmware.sh)."""
+    view = EdlView()
+    stream = sys.stdin.buffer
+    while True:
+        data = stream.read1(4096) if hasattr(stream, "read1") else stream.read(4096)
+        if not data:
+            break
+        view.feed(data.decode("utf-8", "replace"))
+    view.close()
+    return EXIT_OK
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--root", default=DEFAULT_ROOT, help="backup store (default: %(default)s)")
@@ -398,6 +546,8 @@ def main(argv=None):
     i.set_defaults(fn=cmd_import)
 
     sub.add_parser("list", help="show stored units and backups").set_defaults(fn=cmd_list)
+
+    sub.add_parser("view", help="render edl output from stdin, minimal-verbose").set_defaults(fn=cmd_view)
 
     v = sub.add_parser("verify", help="re-hash a backup against its manifest")
     v.add_argument("dir")

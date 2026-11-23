@@ -37,43 +37,33 @@ die()  { printf '%s[-]%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
 hms()  { printf '%dh %02dm %02ds' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }   # seconds -> H M S
 PY=""; ADB=""; EDL="${EDL_BIN:-}"
 
-# Run one edl command as a single tidy step:
-#   [*] Writing rootfs (17 MB)  45.123%  15.2 MB/s  12s     (live, on a terminal)
-#   [*] Writing rootfs (17 MB) ✓ 14s
-# On failure edl's last 20 meaningful lines are shown. With --debug edl's raw
-# output goes to the screen as well. Returns edl's exit status (callers decide
-# whether it is fatal).
+# Run one edl command as a step, minimal-verbose:
+#   [*] Writing rootfs (17 MB)
+#         connected · firehose mode
+#         45.123%  15.24 MB/s          (updates in place)
+#         wrote system.img → sector 214050
+#       ✓ 14s
+# edl's banners, harmless warnings and progress frames are dropped by
+# "radio_backup.py view"; errors are always shown. --debug shows the raw
+# output instead. Returns edl's exit status (callers decide if it is fatal).
 edl_step() {
     local label="$1"; shift
-    local out rc=0 start=$SECONDS pid spin='|/-\' i=0 pct speed tailtxt
-    out="$(mktemp)"
+    local rc start=$SECONDS
+    printf '%s[*]%s %s\n' "$c_g" "$c_0" "$label"
+    set +e
     if [[ "$FLASH_DEBUG" == 1 ]]; then
-        printf '%s[*]%s %s…\n' "$c_g" "$c_0" "$label"
-        "$EDL" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
-    elif [[ -t 1 ]]; then
-        "$EDL" "$@" >"$out" 2>&1 &
-        pid=$!
-        while kill -0 "$pid" 2>/dev/null; do
-            # edl redraws "Progress: |###| 45.123% Write (...) 15.24 MB/s" with \r
-            tailtxt="$(tail -c 400 "$out" 2>/dev/null | tr '\r' '\n' | grep 'Progress:' | tail -n 1)" || true
-            pct="$(printf '%s' "$tailtxt" | grep -oE '[0-9]{1,3}\.[0-9]+%' | tail -n 1)" || true
-            speed="$(printf '%s' "$tailtxt" | grep -oE '[0-9.]+ [KMG]B/s' | tail -n 1)" || true
-            printf '\r\033[K%s[*]%s %s  %s  %s%s%ds' "$c_g" "$c_0" "$label" "${pct:-${spin:i++%4:1}}" \
-                "${speed:+$speed  }" "" $((SECONDS - start))
-            sleep 0.2
-        done
-        wait "$pid" || rc=$?
-        printf '\r\033[K'
+        "$EDL" "$@" 2>&1
+        rc=$?
     else
-        "$EDL" "$@" >"$out" 2>&1 || rc=$?
+        "$EDL" "$@" 2>&1 | "$PY" -I radio_backup.py view
+        rc=${PIPESTATUS[0]}
     fi
+    set -e
     if [[ $rc -eq 0 ]]; then
-        printf '%s[*]%s %s %s✓%s %ds\n' "$c_g" "$c_0" "$label" "$c_g" "$c_0" $((SECONDS - start))
+        printf '      %s✓%s %ds\n' "$c_g" "$c_0" $((SECONDS - start))
     else
-        printf '%s[-]%s %s failed (edl exit %d). Last edl output:\n' "$c_r" "$c_0" "$label" "$rc"
-        { tr '\r' '\n' <"$out" | grep -vE '^[[:space:]]*$|Progress:|^Done \|' | tail -n 20 | sed 's/^/      /'; } || true
+        printf '      %s✗ failed (edl exit %d)%s — run with --debug for edl'"'"'s full output\n' "$c_r" "$rc" "$c_0"
     fi
-    rm -f "$out"
     return "$rc"
 }
 
@@ -344,8 +334,15 @@ enter_edl
 # Always save this unit's live radio + boot chain permanently FIRST, filed by
 # chip serial (backup/units/<serial>/<timestamp>/). It must be the first edl
 # call of the session: only then does edl report the serial.
-LIVE="$("$PY" -I radio_backup.py backup --edl "$EDL" --print-path)" \
-    || die "radio backup failed — nothing has been written to the dongle"
+rc=0; LIVE="$("$PY" -I radio_backup.py backup --edl "$EDL" --print-path)" || rc=$?
+if [[ $rc -eq 4 ]]; then
+    # Still in firehose mode from an interrupted run: the chip no longer reports
+    # its serial, so the backup cannot be filed. Nothing was written: reboot it
+    # back into OpenWrt and let the user start again.
+    edl_step "Rebooting the dongle back into OpenWrt" reset || true
+    die "Nothing was written. Wait ~1 minute for the dongle to boot, then run ./flash-firmware.sh again."
+fi
+[[ $rc -eq 0 ]] || die "radio backup failed — nothing has been written to the dongle"
 [[ -d "$LIVE" ]] || die "radio backup returned no folder — nothing has been written to the dongle"
 
 SAVED=""
