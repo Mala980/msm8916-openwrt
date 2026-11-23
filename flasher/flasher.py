@@ -382,6 +382,46 @@ def list_all_backups() -> int:
     return rc
 
 
+def restore_stock() -> int:
+    """Restore to stock from a full dump, or from a golden dump + a unit's
+    unique-partition backup (convert mode keeps only the latter per unit)."""
+    import tempfile
+    import convert
+
+    backup_root = FLASHER_DIR / "backup"
+    choices = []
+    for d in sorted(backup_root.glob("stock-*"), reverse=True):
+        if (d / "restore_sectors.txt").is_file():
+            tag = (d / "STOCK_VERSION").read_text().strip() if (d / "STOCK_VERSION").is_file() else "?"
+            choices.append(("full", d, "full stock dump %s (stock %s)" % (d.name, tag)))
+    for ident in sorted(UNITS_DIR.glob("*/*/identity.json"), reverse=True):
+        d = ident.parent
+        choices.append(("unit", d, "unit %s %s (unique partitions + golden dump)" % (d.parent.name, d.name)))
+    if not choices:
+        print(f"{C_RED}[-] No stock dumps or convert-mode unit backups found.{C_RESET}")
+        return 1
+    print(f"\n{C_CYAN}=== Restore stock firmware ==={C_RESET}")
+    for i, (_, _, label) in enumerate(choices, 1):
+        print(f"  {i:2d}) {label}")
+    try:
+        sel = input(f"\nSelect [1-{len(choices)}] (Enter = cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    if not sel.isdigit() or not 1 <= int(sel) <= len(choices):
+        print("Cancelled.")
+        return 0
+    kind, d, _ = choices[int(sel) - 1]
+    if kind == "full":
+        return run_script("restore-stock.sh", [str(d)])
+    try:
+        combined = convert.assemble_stock_restore(d, backup_root, Path(tempfile.mkdtemp(prefix="stock-restore-")))
+    except ValueError as e:
+        print(f"{C_RED}[-] {e}{C_RESET}")
+        return 1
+    print(f"{C_GREEN}[*]{C_RESET} Golden dump + unit {d.parent.name}'s own partitions assembled in {combined}")
+    return run_script("restore-stock.sh", [str(combined)])
+
+
 def open_ssh() -> int:
     """Open an interactive SSH session to the modem."""
     for host in ("192.168.8.1", "192.168.1.1"):
@@ -454,7 +494,7 @@ def interactive_menu() -> int:
         elif choice == "6":
             restore_radio_only()
         elif choice == "7":
-            run_script("restore-stock.sh")
+            restore_stock()
         elif choice == "8":
             reboot_to_edl()
         elif choice == "9":
@@ -506,7 +546,7 @@ def main() -> int:
     if args.backup_stock:
         return run_script("backup-stock.sh")
     if args.restore_stock:
-        return run_script("restore-stock.sh")
+        return restore_stock()
     if args.restore_radio:
         return restore_radio_only()
     if args.list_backups:

@@ -307,3 +307,37 @@ def real_env(flasher_dir: Path, adb: str, edl: str) -> ConvertEnv:
         adb_devices=adb_devices, openwrt_online=openwrt_online,
         read_identity=lambda: read_stock_identity(adb), run=run, run_capture=run_capture,
         verify_openwrt=verify_openwrt, sleep=time.sleep)
+
+
+# ---------------------------------------------------------------------------
+# Restore to stock from a golden dump + a unit's unique partitions
+
+from radio_backup import UNIQUE_PARTS  # noqa: E402  (single source of truth)
+
+
+def assemble_stock_restore(unit_backup: Path, backup_root: Path, out_dir: Path) -> Path:
+    """A folder restore-stock.sh can use: every file of the golden dump for the
+    unit's stock version, with the unit's own unique partitions in place of the
+    golden ones. Raises ValueError (before anything touches a device) when the
+    unit has no identity.json/version or there is no golden dump for it."""
+    unit_backup, out_dir = Path(unit_backup), Path(out_dir)
+    ident_file = unit_backup / "identity.json"
+    if not ident_file.is_file():
+        raise ValueError("%s has no identity.json (not a convert-mode backup)" % unit_backup)
+    version = json.loads(ident_file.read_text()).get("version", "")
+    golden = find_golden(backup_root, version)
+    if golden is None:
+        raise ValueError("no golden stock dump for version %r — cannot rebuild the stock image"
+                         % (version or "unknown"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for f in golden.iterdir():
+        if f.is_file():
+            os.symlink(str(f.resolve()), str(out_dir / f.name))
+    for p in UNIQUE_PARTS:
+        src = unit_backup / (p + ".bin")
+        if src.is_file():
+            dst = out_dir / (p + ".bin")
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            os.symlink(str(src.resolve()), str(dst))
+    return out_dir

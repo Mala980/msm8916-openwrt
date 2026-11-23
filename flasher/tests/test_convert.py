@@ -293,5 +293,39 @@ class RealEnvParsingTest(unittest.TestCase):
                          {"imei": "", "wifi_up": False, "modem_present": False})
 
 
+class CombinedRestoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "backup"
+        golden = make_dump(self.root, "stock-20261123-122955", "V2.3.15.1")
+        for p in UNIQUE + ["modem", "boot"]:
+            (golden / (p + ".bin")).write_bytes(b"golden-" + p.encode())
+        self.unit = self.root / "units" / "0x0bc56cbf" / "20261123-130500"
+        self.unit.mkdir(parents=True)
+        for p in UNIQUE:
+            (self.unit / (p + ".bin")).write_bytes(b"unit-" + p.encode())
+        (self.unit / "identity.json").write_text('{"version": "V2.3.15.1", "imei": "860018046041589"}')
+        self.out = Path(self.tmp.name) / "combined"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_combined_restore_uses_unit_unique_parts(self):
+        d = convert.assemble_stock_restore(self.unit, self.root, self.out)
+        self.assertEqual((d / "modemst1.bin").read_bytes(), b"unit-modemst1")
+        self.assertEqual((d / "persist.bin").read_bytes(), b"unit-persist")
+        self.assertEqual((d / "system.bin").read_bytes(), b"sys")
+        self.assertEqual((d / "modem.bin").read_bytes(), b"golden-modem")
+        self.assertTrue((d / "restore_sectors.txt").is_file())
+
+    def test_combined_restore_without_golden_refuses(self):
+        (self.unit / "identity.json").write_text('{"version": "V9.9"}')
+        with self.assertRaises(ValueError):
+            convert.assemble_stock_restore(self.unit, self.root, self.out)
+        (self.unit / "identity.json").unlink()
+        with self.assertRaises(ValueError):
+            convert.assemble_stock_restore(self.unit, self.root, self.out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
