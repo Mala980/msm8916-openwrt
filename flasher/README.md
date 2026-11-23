@@ -321,6 +321,30 @@ Log in as `root` with an empty password. This is the OpenWrt-Liberty interface.
 
 ---
 
+## Converting many factory dongles
+
+`python3 flasher.py --convert` (menu: **c**) turns factory dongles into OpenWrt
+one after another. Plug in **one** factory dongle (ADB) at a time; per dongle it:
+
+1. reads the stock version, IMEI, Wi-Fi MAC and serial over ADB;
+2. backs up only the partitions unique to that unit (`fsc fsg modemst1
+   modemst2 persist sec DDR ssd`, ~37 MB) with an `identity.json`, under
+   `backup/units/<chip serial>/`;
+3. flashes OpenWrt from `firmware/openwrt-stable` with the unit's own radio
+   data (no questions asked);
+4. checks on 192.168.8.1 that the IMEI equals the stock IMEI, Wi-Fi is up and
+   the modem is present, then waits for you to unplug it.
+
+Everything that is the same on every unit of one stock version comes from a
+**golden** full stock dump (`backup/stock-*` with a `STOCK_VERSION` file). The
+first dongle of a stock version without a golden dump gets a full dump, which
+becomes the golden one. "Restore stock firmware" rebuilds a unit's factory
+image from the golden dump plus that unit's own partitions.
+
+Unplug any dongle already running OpenWrt before you start: the result is
+verified on 192.168.8.1. Convert mode refuses a dongle that already runs
+OpenWrt and stops at the first failure, printing the unit's backup folder.
+
 ## Per-unit radio backups
 
 Each dongle's `modemst1`, `modemst2`, `fsg`, `fsc`, `sec`, `persist` and `modem`

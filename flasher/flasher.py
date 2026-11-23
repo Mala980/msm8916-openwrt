@@ -382,6 +382,27 @@ def list_all_backups() -> int:
     return rc
 
 
+def run_convert() -> int:
+    """Convert stock dongles to OpenWrt one after another (see convert.py)."""
+    import convert
+
+    adb, edl = find_adb(), find_edl()
+    if not adb:
+        print(f"{C_RED}[-] adb not found (needed to read stock dongles). Install it or run 'Flash OpenWrt' once.{C_RESET}")
+        return 1
+    if not edl:
+        print(f"{C_RED}[-] edl not found. Run 'Flash OpenWrt' once to install it into ./temp/edl.{C_RESET}")
+        return 1
+    print(f"{C_CYAN}=== Convert stock dongles → OpenWrt ==={C_RESET}")
+    print("  Per dongle: back up its unique partitions (IMEI, calibration, MACs), flash OpenWrt,")
+    print("  verify IMEI + Wi-Fi, then wait for the next one. Plug in ONE dongle at a time.")
+    try:
+        return convert.convert_loop(convert.real_env(FLASHER_DIR, adb, edl))
+    except KeyboardInterrupt:
+        print(f"\n{C_YELLOW}[!] Convert mode stopped.{C_RESET}")
+        return 130
+
+
 def restore_stock() -> int:
     """Restore to stock from a full dump, or from a golden dump + a unit's
     unique-partition backup (convert mode keeps only the latter per unit)."""
@@ -460,6 +481,7 @@ def interactive_menu() -> int:
         dbg = f"{C_YELLOW}ON{C_RESET}" if debug_mode() else f"{C_DIM}off{C_RESET}"
         print(f"  {C_BOLD}Flash{C_RESET}")
         print("    1) Flash OpenWrt firmware")
+        print("    c) Convert stock dongles → OpenWrt (batch: backup + flash + verify, one after another)")
         print(f"  {C_BOLD}Backup{C_RESET}")
         print("    2) Back up radio + boot chain    (12 partitions, per unit)")
         print("    3) Back up radio only            (7 IMEI/RF partitions, per unit)")
@@ -476,13 +498,15 @@ def interactive_menu() -> int:
         print()
 
         try:
-            choice = input("Select [0-9, d]: ").strip().lower()
+            choice = input("Select [0-9, c, d]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
 
         if choice == "1":
             run_script("flash-firmware.sh", ["--debug"] if debug_mode() else None)
+        elif choice == "c":
+            run_convert()
         elif choice == "2":
             run_radio_backup(radio_only=False)
         elif choice == "3":
@@ -519,6 +543,8 @@ def parse_args() -> argparse.Namespace:
         description="All-in-One MSM8916 4G Dongle Flasher & Recovery Toolkit"
     )
     parser.add_argument("--flash", action="store_true", help="Run OpenWrt firmware flasher")
+    parser.add_argument("--convert", action="store_true",
+                        help="Convert stock dongles to OpenWrt one after another (backup + flash + verify)")
     parser.add_argument("--debug", action="store_true", help="Show edl's raw output (any action)")
     parser.add_argument("--backup-radio", action="store_true", help="Backup radio + boot chain (12 partitions)")
     parser.add_argument("--backup-radio-only", action="store_true", help="Backup radio/IMEI partitions only (7 partitions)")
@@ -537,6 +563,8 @@ def main() -> int:
     if args.debug:
         os.environ["FLASH_DEBUG"] = "1"
 
+    if args.convert:
+        return run_convert()
     if args.flash:
         return run_script("flash-firmware.sh", ["--debug"] if args.debug else None)
     if args.backup_radio:
