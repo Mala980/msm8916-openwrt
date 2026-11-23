@@ -1,0 +1,4 @@
+#!/bin/sh
+# Enable the local link speed test files (see /etc/init.d/lan-speed).
+[ -x /etc/init.d/lan-speed ] && /etc/init.d/lan-speed enable
+exit 0

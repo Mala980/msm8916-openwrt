@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Files for the Speedtest page's local link test (this device <-> router).
+# Downloads are static files served by uhttpd directly -- streaming them from
+# a CGI caps out far below USB / Wi-Fi speed. They are sparse files in tmpfs,
+# so they read as zeros and use no RAM. Uploads go to /cgi-bin/lan-speed.
+
+START=95
+
+DIR=/tmp/lan-speed
+
+start() {
+	mkdir -p "$DIR"
+	: > "$DIR/ping"
+	for mb in 10 25 50 100; do
+		[ -e "$DIR/${mb}M.bin" ] && continue
+		truncate -s "${mb}M" "$DIR/${mb}M.bin" 2>/dev/null ||
+			dd if=/dev/zero of="$DIR/${mb}M.bin" bs=1 count=0 seek="${mb}M" 2>/dev/null
+	done
+	[ -L /www/lan-speed ] || ln -sfn "$DIR" /www/lan-speed
+}

@@ -1,0 +1,46 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Local link speed test endpoint for the LuCI Speedtest page: measures the
+# link between the browser's device and this router (USB / Wi-Fi), with no
+# internet involved. Reachable from the LAN only (the firewall drops WAN input).
+#
+#   POST /cgi-bin/lan-speed?mode=up   read and discard the body (max 100 MB)
+#
+# Downloads and latency use static files in /www/lan-speed (see
+# /etc/init.d/lan-speed): uhttpd streams those far faster than a CGI can, and
+# a static ping does not include starting this script.
+
+MAX_BYTES=104857600
+
+param() {
+	echo "&${QUERY_STRING}&" | sed -n "s/.*&$1=\([^&]*\)&.*/\1/p"
+}
+
+headers() { # headers <content-type> [content-length]
+	printf 'Status: 200 OK\r\n'
+	printf 'Content-Type: %s\r\n' "$1"
+	printf 'Cache-Control: no-store\r\n'
+	[ -n "$2" ] && printf 'Content-Length: %s\r\n' "$2"
+	printf '\r\n'
+}
+
+fail() {
+	printf 'Status: 400 Bad Request\r\nContent-Type: text/plain\r\n\r\n%s\n' "$1"
+	exit 0
+}
+
+case "$(param mode)" in
+	up)
+		[ "$REQUEST_METHOD" = "POST" ] || fail "upload needs POST"
+		len="${CONTENT_LENGTH:-0}"
+		case "$len" in ''|*[!0-9]*) fail "missing Content-Length" ;; esac
+		[ "$len" -gt "$MAX_BYTES" ] && fail "upload larger than 100 MB"
+		head -c "$len" >/dev/null
+		headers application/json
+		printf '{"received":%s}\n' "$len"
+		;;
+	*)
+		fail "mode must be up"
+		;;
+esac

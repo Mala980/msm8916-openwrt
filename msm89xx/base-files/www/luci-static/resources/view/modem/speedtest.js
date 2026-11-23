@@ -6,11 +6,11 @@
 
 /*
 	Speedtest page.
-	- Speedtest by Ookla: runs on the router (modem-speedtest ookla) with the
-	  official CLI, installed on request by ookla-speedtest-install.
-	- Browser test: ping, download and upload from this browser against the
-	  server it names (client -> router -> internet).
-	Both engines share the gauges, metric cards, throughput chart and history.
+	- Speedtest by Ookla: the router's internet connection, measured on the
+	  router (modem-speedtest ookla) with the official CLI, installed on request
+	  by ookla-speedtest-install.
+	- Local link test: this device <-> router (USB / Wi-Fi), no internet.
+	Both share the gauges, metric cards, throughput chart and history.
 */
 
 var callGetSignal = rpc.declare({
@@ -69,26 +69,18 @@ var callCancelSpeedtest = rpc.declare({
 	expect: { '': {} }
 });
 
-// Browser test targets. Each entry pings, downloads and uploads against the
-// same service, so the result really describes the server named here.
-var GATEWAYS = [
-	{
-		id: 'cloudflare',
-		name: 'Cloudflare (speed.cloudflare.com)',
-		location: 'Nearest Cloudflare edge',
-		pingUrl: 'https://speed.cloudflare.com/__down?bytes=0',
-		downUrl: 'https://speed.cloudflare.com/__down?bytes=',
-		upUrl: 'https://speed.cloudflare.com/__up'
-	},
-	{
-		id: 'custom',
-		name: 'Custom server (your own URLs)',
-		location: 'Custom target',
-		pingUrl: '',
-		downUrl: '',
-		upUrl: ''
-	}
-];
+// Local link test: this device <-> the router, no internet involved.
+// Downloads are static sparse files (/www/lan-speed, see /etc/init.d/lan-speed)
+// that uhttpd streams at full speed; uploads go to /cgi-bin/lan-speed.
+var LOCAL_TARGET = {
+	id: 'local',
+	name: 'This router (local link)',
+	location: 'USB / Wi-Fi',
+	pingUrl: '/lan-speed/ping',
+	downUrlFor: function(bytes) { return '/lan-speed/' + Math.round(bytes / 1048576) + 'M.bin'; },
+	upUrl: '/cgi-bin/lan-speed?mode=up'
+};
+var LOCAL_DIAL_MAX = 300;
 
 function createMetricCard(title, valId, subId, badgeId, defaultVal, defaultSub, accentColor) {
 	return E('div', {
@@ -270,9 +262,9 @@ return view.extend({
 			t.classList.toggle('st-engine-active', on);
 			t.setAttribute('aria-pressed', on ? 'true' : 'false');
 		});
-		var po = document.getElementById('st-panel-ookla'), pb = document.getElementById('st-panel-browser');
+		var po = document.getElementById('st-panel-ookla'), pl = document.getElementById('st-panel-local');
 		if (po) po.style.display = (engine === 'ookla') ? '' : 'none';
-		if (pb) pb.style.display = (engine === 'browser') ? '' : 'none';
+		if (pl) pl.style.display = (engine === 'local') ? '' : 'none';
 		this.updateStartButton();
 		try { localStorage.setItem('modem_speedtest_engine', engine); } catch(e) {}
 	},
@@ -589,7 +581,7 @@ return view.extend({
 				E('td', { 'style': 'font-weight: 600;' }, [
 					E('div', {}, row.server || '--'),
 					E('div', { 'style': 'font-size: 10px; color: var(--text-color-medium);' },
-						(row.engine === 'ookla' ? 'Ookla' : (row.engine === 'browser' ? _('Browser') : '')) + (row.location ? ' · ' + row.location : ''))
+						(row.engine === 'ookla' ? 'Ookla' : (row.engine === 'local' ? _('Local link') : '')) + (row.location ? ' · ' + row.location : ''))
 				]),
 				E('td', { 'style': 'font-family: monospace; color: #38bdf8;' }, row.band || '--'),
 				E('td', { 'style': 'font-family: monospace; font-weight: 600;' }, (row.ping_avg ? row.ping_avg + ' ms' : '--')),
@@ -634,8 +626,8 @@ return view.extend({
 		this.setGaugeState('download', _('Waiting'), '#94a3b8');
 		this.setGaugeState('upload', _('Waiting'), '#94a3b8');
 
-		var rfInfo = { band: '' };
-		try { rfInfo.band = this.setNetworkCard(await callGetSignal()).label; } catch(e) {}
+		var rfInfo = { band: _('Local link') };
+		var dialMax = { dl: LOCAL_DIAL_MAX, ul: LOCAL_DIAL_MAX };
 
 		// ==========================================
 		// PHASE 1/3: PING LATENCY & RFC 3550 JITTER
@@ -643,7 +635,7 @@ return view.extend({
 		this.updateProgress(10, _('Measuring latency…'), '#94a3b8');
 		var pingTimes = [];
 		var drops = 0;
-		var pingUrl = gwConfig.pingUrl || 'https://speed.cloudflare.com/__down?bytes=0';
+		var pingUrl = gwConfig.pingUrl;
 
 		for (var p = 0; p < 10; p++) {
 			if (signal.aborted) return;
@@ -685,7 +677,8 @@ return view.extend({
 		this.setGaugeState('download', _('Testing'), '#38bdf8', 'rgba(56,189,248,0.15)');
 
 		var downBytesTarget = sizeConfig.bytes;
-		var downUrl = gwConfig.downUrl + downBytesTarget + '&t=' + Date.now();
+		var downBase = gwConfig.downUrlFor ? gwConfig.downUrlFor(downBytesTarget) : gwConfig.downUrl + downBytesTarget;
+		var downUrl = downBase + (downBase.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
 		var finalDlMbps = 0;
 
 		try {
@@ -712,7 +705,7 @@ return view.extend({
 						var elDlPeak = document.getElementById('st-dl-peak');
 						if (elDlPeak) elDlPeak.textContent = self.peakDownload.toFixed(2);
 
-						self.updateDial('st-dl-dial', instantMbps, 100);
+						self.updateDial('st-dl-dial', instantMbps, dialMax.dl);
 
 						self.downloadPoints.push(instantMbps);
 						if (self.downloadPoints.length > self.maxPointsPerPhase) self.downloadPoints.shift();
@@ -745,7 +738,7 @@ return view.extend({
 			upPayload[k] = (k & 0xff);
 		}
 
-		var upUrl = gwConfig.upUrl || 'https://speed.cloudflare.com/__up';
+		var upUrl = gwConfig.upUrl;
 		var finalUlMbps = 0;
 
 		await new Promise(function(resolveUp) {
@@ -769,7 +762,7 @@ return view.extend({
 					var elUlPeak = document.getElementById('st-ul-peak');
 					if (elUlPeak) elUlPeak.textContent = self.peakUpload.toFixed(2);
 
-					self.updateDial('st-ul-dial', instantMbps, 50);
+					self.updateDial('st-ul-dial', instantMbps, dialMax.ul);
 
 					self.uploadPoints.push(instantMbps);
 					if (self.uploadPoints.length > self.maxPointsPerPhase) self.uploadPoints.shift();
@@ -820,7 +813,7 @@ return view.extend({
 			timestamp: ts,
 			server: gwConfig.name,
 			location: gwConfig.location,
-			engine: 'browser',
+			engine: 'local',
 			band: rfInfo.band,
 			ping_avg: avgPing > 0 ? avgPing.toFixed(1) : '--',
 			jitter: jitter > 0 ? jitter.toFixed(1) : '--',
@@ -876,24 +869,13 @@ return view.extend({
 
 		var startEngine = 'ookla';
 		try { startEngine = localStorage.getItem('modem_speedtest_engine') || 'ookla'; } catch(e) {}
-		if (startEngine !== 'browser') startEngine = 'ookla';
+		if (startEngine !== 'local') startEngine = 'ookla';
 
-		// --- Browser test controls ---
-		var customGwBox = E('div', { 'id': 'st-custom-gw-box', 'class': 'st-custom-grid', 'style': 'display: none;' }, [
-			E('input', { 'id': 'st-custom-ping', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('Ping URL') }),
-			E('input', { 'id': 'st-custom-down', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('Download URL (size is appended)') }),
-			E('input', { 'id': 'st-custom-up', 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('Upload URL') })
-		]);
-
-		var gwSelect = E('select', {
-			'id': 'st-gateway-select', 'class': 'cbi-input-select st-input',
-			'change': function(ev) { customGwBox.style.display = (ev.target.value === 'custom') ? 'grid' : 'none'; }
-		}, GATEWAYS.map(function(g) { return E('option', { 'value': g.id }, g.name); }));
-
+		// --- Local link test controls ---
 		var sizeSelect = E('select', { 'id': 'st-size-select', 'class': 'cbi-input-select st-input' }, [
-			E('option', { 'value': 'fast' }, _('Quick (5 MB each way)')),
-			E('option', { 'value': 'standard', 'selected': 'selected' }, _('Standard (10 MB each way)')),
-			E('option', { 'value': 'deep' }, _('Extended (25 MB each way)'))
+			E('option', { 'value': '25' }, _('Quick (25 MB each way)')),
+			E('option', { 'value': '50', 'selected': 'selected' }, _('Standard (50 MB each way)')),
+			E('option', { 'value': '100' }, _('Extended (100 MB each way)'))
 		]);
 
 		// --- Engine switch ---
@@ -912,18 +894,7 @@ return view.extend({
 					self.runOokla((document.getElementById('ookla-server') || {}).value || '');
 					return;
 				}
-				var gwId = gwSelect.value || 'cloudflare';
-				var gw = GATEWAYS.find(function(g) { return g.id === gwId; }) || GATEWAYS[0];
-				if (gwId === 'custom') {
-					gw = {
-						id: 'custom', name: _('Custom server'), location: _('Custom target'),
-						pingUrl: document.getElementById('st-custom-ping').value || '',
-						downUrl: document.getElementById('st-custom-down').value || '',
-						upUrl: document.getElementById('st-custom-up').value || ''
-					};
-				}
-				var bytes = { fast: 5000000, standard: 10000000, deep: 25000000 }[sizeSelect.value] || 10000000;
-				self.runSpeedtest(gw, { bytes: bytes });
+				self.runSpeedtest(LOCAL_TARGET, { bytes: (parseInt(sizeSelect.value, 10) || 50) * 1048576 });
 			}
 		}, _('Start'));
 
@@ -985,23 +956,21 @@ return view.extend({
 			E('div', { 'style': 'margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-color-medium);' }, [
 				E('h2', { 'style': 'margin: 0 0 4px; font-size: 18px; font-weight: 700;' }, _('Speedtest')),
 				E('div', { 'style': 'font-size: 12px; color: var(--text-color-medium);' },
-					_('Measure the cellular connection from the router with Speedtest by Ookla, or from this browser.'))
+					_('Test the internet connection of the router with Speedtest by Ookla, or the link between this device and the router.'))
 			]),
 
 			// Controls
 			E('div', { 'class': 'cbi-section rf-cockpit-card st-card' }, [
 				E('div', { 'class': 'st-engines' }, [
 					engineTab('ookla', _('Speedtest by Ookla'), _('Runs on the router · nearest Ookla server')),
-					engineTab('browser', _('Browser test'), _('This device → router → internet'))
+					engineTab('local', _('Local link test'), _('This device ↔ router (USB / Wi-Fi) · no internet'))
 				]),
 				E('div', { 'class': 'st-controls' }, [
 					E('div', { 'class': 'st-panel', 'id': 'st-panel-ookla' }, '--'),
-					E('div', { 'class': 'st-panel', 'id': 'st-panel-browser', 'style': 'display: none;' }, [
-						E('div', { 'style': 'display: flex; flex-wrap: wrap; gap: 12px;' }, [
-							E('div', {}, [ E('label', { 'class': 'st-label' }, _('Server')), gwSelect ]),
-							E('div', {}, [ E('label', { 'class': 'st-label' }, _('Data size')), sizeSelect ])
-						]),
-						customGwBox
+					E('div', { 'class': 'st-panel', 'id': 'st-panel-local', 'style': 'display: none;' }, [
+						E('label', { 'class': 'st-label' }, _('Data size')),
+						sizeSelect,
+						E('div', { 'class': 'st-hint' }, _('Measures the connection between this device and the router. If it is much faster than the Ookla result, the cellular link is the bottleneck; if it is slower, check the USB cable or Wi-Fi.'))
 					]),
 					E('div', { 'class': 'st-actions' }, [ btnStart, btnStop ])
 				]),
