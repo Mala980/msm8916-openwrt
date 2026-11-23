@@ -17,6 +17,14 @@
 #
 #   ./flash-firmware.sh            normal, tidy output
 #   ./flash-firmware.sh --debug    also show edl's raw output (FLASH_DEBUG=1)
+#
+# Non-interactive (used by flasher.py convert mode):
+#   --firmware DIR        firmware folder instead of the menu
+#   --radio-from DIR      radio partitions (fsc fsg modemst1 modemst2 modem
+#                         persist sec) from DIR instead of asking
+#   --skip-live-backup    do not back up the dongle first; only together with
+#                         --radio-from (the caller already backed it up)
+#   --yes                 do not ask for confirmation
 # ===========================================================================
 # The whole script is one { ... } block: bash parses all of it before running
 # anything, so editing this file while a flash is in progress cannot make the
@@ -25,7 +33,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 trap '' HUP
-case "${1:-}" in --debug|-d) FLASH_DEBUG=1 ;; esac
+ARG_FW=""; ARG_RADIO=""; ARG_SKIP_LIVE=0; ARG_YES=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --debug|-d) FLASH_DEBUG=1 ;;
+        --firmware) ARG_FW="${2:?--firmware needs a directory}"; shift ;;
+        --radio-from) ARG_RADIO="${2:?--radio-from needs a directory}"; shift ;;
+        --skip-live-backup) ARG_SKIP_LIVE=1 ;;
+        --yes|-y) ARG_YES=1 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ "$ARG_SKIP_LIVE" = 1 ] && [ -z "$ARG_RADIO" ]; then
+    echo "--skip-live-backup needs --radio-from DIR (the radio data has to come from somewhere)" >&2
+    exit 2
+fi
 FLASH_DEBUG="${FLASH_DEBUG:-0}"; export FLASH_DEBUG
 
 # ===== self-contained tooling — everything installs into ./temp (gitignored) =====
@@ -155,10 +178,17 @@ enter_edl() {
 }
 is_edl() {
     local os; os="$(uname -s)"
+    # Capture first, then match: with pipefail, "tool | grep -q" fails when
+    # grep exits at the first match and the tool dies of SIGPIPE, which made
+    # a dongle in EDL look absent (and the script then went looking for it
+    # on the network).
+    local usb
     if [[ "$os" == Darwin ]]; then
-        ioreg -p IOUSB -w0 2>/dev/null | grep -qiE "0x9008|QHSUSB|QDLoader"
+        usb="$(ioreg -p IOUSB -w0 2>/dev/null || true)"
+        grep -qiE "0x9008|QHSUSB|QDLoader" <<<"$usb"
     elif [[ "$os" == Linux ]]; then
-        lsusb 2>/dev/null | grep -qiE "05c6:9008|QHSUSB|QDLoader"
+        usb="$(lsusb 2>/dev/null || true)"
+        grep -qiE "05c6:9008|QHSUSB|QDLoader" <<<"$usb"
     else
         return 1
     fi
@@ -209,12 +239,15 @@ for sub in firmware/*/; do
     fi
 done
 
-echo "=== Select OpenWrt Firmware to Flash ==="
 SELECTED_FW_DIR=""
-if [[ ${#FW_DIRS[@]} -eq 0 ]]; then
+if [[ -n "$ARG_FW" ]]; then
+    SELECTED_FW_DIR="$ARG_FW"
+elif [[ ${#FW_DIRS[@]} -eq 0 ]]; then
+    echo "=== Select OpenWrt Firmware to Flash ==="
     warn "No pre-configured firmware directories found."
     read -e -r -p "Enter path to firmware folder: " SELECTED_FW_DIR
 else
+    echo "=== Select OpenWrt Firmware to Flash ==="
     for i in "${!FW_DIRS[@]}"; do
         printf "  %d) %s\n" "$((i+1))" "${FW_LABELS[$i]}"
     done
@@ -264,13 +297,17 @@ RADIO="fsc fsg modemst1 modemst2 modem persist sec"
 
 echo
 warn "This ERASES the OpenWrt overlay / any existing config on the dongle."
-echo "Choose radio/modem partitions source ($RADIO):"
-echo "  1) Read live from connected dongle (default - preserves current dongle state)"
-echo "  2) Restore from local radio/stock backup (./backup/units/<serial>/*, ./backup/*)"
-echo "     Either way, this unit's live radio data is first saved permanently to"
-echo "     ./backup/units/<chip serial>/ (see: python3 radio_backup.py list)."
-read -r -p "Select source [1/2] (default 1): " RADIO_SRC
-RADIO_SRC="${RADIO_SRC:-1}"
+if [[ -n "$ARG_RADIO" ]]; then
+    RADIO_SRC=2
+else
+    echo "Choose radio/modem partitions source ($RADIO):"
+    echo "  1) Read live from connected dongle (default - preserves current dongle state)"
+    echo "  2) Restore from local radio/stock backup (./backup/units/<serial>/*, ./backup/*)"
+    echo "     Either way, this unit's live radio data is first saved permanently to"
+    echo "     ./backup/units/<chip serial>/ (see: python3 radio_backup.py list)."
+    read -r -p "Select source [1/2] (default 1): " RADIO_SRC
+    RADIO_SRC="${RADIO_SRC:-1}"
+fi
 
 STOCK_DIR=""
 if [[ "$RADIO_SRC" == "2" ]]; then
@@ -299,7 +336,9 @@ if [[ "$RADIO_SRC" == "2" ]]; then
         fi
     done
 
-    if [[ ${#RADIO_DIRS[@]} -eq 0 ]]; then
+    if [[ -n "$ARG_RADIO" ]]; then
+        STOCK_DIR="$ARG_RADIO"
+    elif [[ ${#RADIO_DIRS[@]} -eq 0 ]]; then
         warn "No valid radio backup folders found in ./backup/."
         read -e -r -p "Enter path to folder containing radio .bin files: " STOCK_DIR
     else
@@ -325,7 +364,9 @@ if [[ "$RADIO_SRC" == "2" ]]; then
     log "Using radio backup from: $STOCK_DIR"
 fi
 
-read -r -p "Continue flashing? (y/N): " c; [[ "$c" =~ ^[Yy]$ ]] || { log "Cancelled."; exit 0; }
+if [[ "$ARG_YES" != 1 ]]; then
+    read -r -p "Continue flashing? (y/N): " c; [[ "$c" =~ ^[Yy]$ ]] || { log "Cancelled."; exit 0; }
+fi
 
 ensure_edl
 ensure_python
@@ -334,6 +375,10 @@ enter_edl
 # Always save this unit's live radio + boot chain permanently FIRST, filed by
 # chip serial (backup/units/<serial>/<timestamp>/). It must be the first edl
 # call of the session: only then does edl report the serial.
+LIVE=""
+if [[ "$ARG_SKIP_LIVE" == 1 ]]; then
+    log "Skipping the live radio backup (--skip-live-backup): the caller already backed this dongle up."
+else
 rc=0; LIVE="$("$PY" -I radio_backup.py backup --edl "$EDL" --print-path)" || rc=$?
 if [[ $rc -eq 4 ]]; then
     # Still in firehose mode from an interrupted run: the chip no longer reports
@@ -345,9 +390,13 @@ fi
 [[ $rc -eq 0 ]] || die "radio backup failed — nothing has been written to the dongle"
 [[ -d "$LIVE" ]] || die "radio backup returned no folder — nothing has been written to the dongle"
 log "Radio backup saved to: $LIVE"
+fi
 
 SAVED=""
-if [[ "$RADIO_SRC" == "2" ]]; then
+if [[ "$ARG_SKIP_LIVE" == 1 ]]; then
+    SAVED="$STOCK_DIR"
+    log "Will restore radio partitions from: $SAVED"
+elif [[ "$RADIO_SRC" == "2" ]]; then
     # Restoring another unit's radio data clones its IMEI: refuse by default.
     rc=0; "$PY" -I radio_backup.py check "$STOCK_DIR" --against "$LIVE" || rc=$?
     if [[ $rc -ne 0 ]]; then
