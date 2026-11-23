@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # fix-tree-perms.sh <openwrt-tree>
+# fix-tree-perms.sh --repo <project-checkout>   (skips its openwrt/ subtree)
 #
 # Give files in the OpenWrt source tree their normal Unix modes again.
 #
@@ -14,13 +15,16 @@
 #
 # Only files that other users cannot read are touched. Their mode comes from
 # the git index of the repository they belong to (the OpenWrt tree itself and
-# each feed): 100755 -> 755, anything else -> 644. Untracked files get 755 if
-# they start with "#!", else 644. Directories without o+rx get 755.
+# each feed): 100755 -> 755, anything else -> 644. Untracked files (e.g. the
+# BSP copied into target/linux/msm89xx) get 755 if they start with "#!" or are
+# ELF binaries, else 644. Directories without o+rx get 755.
 #
 # Prints the number of files changed; exit status 0.
 set -euo pipefail
 
-tree="${1:?usage: fix-tree-perms.sh <openwrt-tree>}"
+mode=openwrt
+if [ "${1:-}" = "--repo" ]; then mode=repo; shift; fi
+tree="${1:?usage: fix-tree-perms.sh [--repo] <tree>}"
 cd "$tree"
 
 changed=0
@@ -41,15 +45,26 @@ fix_repo() { # fix_repo <dir> <find prune expression...>
     (cd "$repo" && find . "$@" -type f ! -perm -0004 -print) | sed 's#^\./##' > "$bad"
     while IFS=$'\t' read -r m rel; do
         if [ "$m" = "?" ]; then
-            if head -c 2 "$repo/$rel" 2>/dev/null | grep -q '^#!'; then m=755; else m=644; fi
+            case "$(head -c 4 "$repo/$rel" 2>/dev/null | od -An -c | tr -d ' ')" in
+                \#!*|177ELF) m=755 ;;
+                *) m=644 ;;
+            esac
         fi
         chmod "$m" "$repo/$rel"
         changed=$((changed + 1))
-    done < <(awk -F'\t' 'NR == FNR { mode[$2] = $1; next } { print (($0 in mode) ? mode[$0] : "?") "\t" $0 }' "$modes" "$bad")
+    done < <(awk -F'\t' 'FILENAME == ARGV[1] { mode[$2] = $1; next } { print (($0 in mode) ? mode[$0] : "?") "\t" $0 }' "$modes" "$bad")
     rm -f "$bad"
 
     rm -f "$modes"
 }
+
+if [ "$mode" = repo ]; then
+    # The project checkout: everything except the OpenWrt tree inside it.
+    fix_repo . \( -path ./.git -o -path ./openwrt \) -prune -o
+    find . \( -path ./.git -o -path ./openwrt \) -prune -o -type d ! -perm -0005 -exec chmod 755 {} +
+    echo "$changed"
+    exit 0
+fi
 
 # The OpenWrt tree, without build output and without the feeds (fixed below
 # with their own git index).

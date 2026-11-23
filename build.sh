@@ -430,6 +430,14 @@ sync_bsp() {
 
     ok "Syncing BSP into prepared OpenWrt tree..."
 
+    # Normal file modes in the project checkout first: the cp -a copies below
+    # carry them into the OpenWrt tree (see scripts/fix-tree-perms.sh).
+    local fixed_repo
+    fixed_repo=$(docker_exec bash "$CONTAINER_REPO_DIR/scripts/fix-tree-perms.sh" --repo "$CONTAINER_REPO_DIR" | grep -E '^[0-9]+$' | tail -n 1)
+    if [ "${fixed_repo:-0}" -gt 0 ] 2>/dev/null; then
+        warn "Restored normal permissions on $fixed_repo files in the project checkout."
+    fi
+
     # Reinstall the msm89xx target.
     docker_exec sh -c "
         rm -rf $CONTAINER_OPENWRT_DIR/target/linux/msm89xx && \
