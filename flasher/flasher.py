@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 All-in-One MSM8916 4G Dongle Flasher & Recovery Toolkit.
-Unified Python 3 launcher for OpenWrt flashing, stock backup/restore,
-per-unit radio backup inspection, and EDL/SSH utilities.
+Unified Python 3 launcher for OpenWrt flashing, stock/full dump backup & restore,
+per-unit radio backup/verify, and EDL/SSH utilities.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 FLASHER_DIR = Path(__file__).resolve().parent
@@ -25,6 +26,8 @@ C_GREEN = "\033[1;32m"
 C_YELLOW = "\033[1;33m"
 C_RED = "\033[1;31m"
 C_DIM = "\033[2m"
+
+RADIO_ONLY_PARTS = ["fsc", "fsg", "modemst1", "modemst2", "modem", "persist", "sec"]
 
 
 def run_cmd(cmd: list[str], cwd: Path = FLASHER_DIR) -> int:
@@ -46,16 +49,41 @@ def check_tcp(host: str, port: int, timeout: float = 0.6) -> bool:
         return False
 
 
+def find_adb() -> str | None:
+    """Locate adb binary from PATH or ./temp/platform-tools/adb."""
+    adb = shutil.which("adb")
+    if adb:
+        return adb
+    local_adb = FLASHER_DIR / "temp" / "platform-tools" / "adb"
+    return str(local_adb) if local_adb.is_file() else None
+
+
+def find_edl() -> str | None:
+    """Locate edl binary from EDL_BIN, PATH, or ./temp/edl/venv/bin/edl."""
+    env_edl = os.environ.get("EDL_BIN")
+    if env_edl and Path(env_edl).is_file():
+        return env_edl
+    sys_edl = shutil.which("edl")
+    if sys_edl:
+        return sys_edl
+    local_edl = FLASHER_DIR / "temp" / "edl" / "venv" / "bin" / "edl"
+    return str(local_edl) if local_edl.is_file() else None
+
+
 def detect_edl() -> bool:
     """Detect Qualcomm EDL 9008 mode on macOS or Linux."""
     system = platform.system()
     if system == "Darwin":
         res = subprocess.run(
-            ["ioreg", "-p", "IOUSB", "-l"],
+            ["ioreg", "-p", "IOUSB", "-l", "-w0"],
             capture_output=True,
             text=True,
         )
-        return "0x5c6" in res.stdout and "0x9008" in res.stdout
+        out = res.stdout
+        # ioreg prints USB ids in decimal: 05c6:9008 is idVendor 1478 / idProduct 36872
+        if "QHSUSB" in out or "QDLoader" in out:
+            return True
+        return '"idVendor" = 1478' in out and '"idProduct" = 36872' in out
     if system == "Linux" and shutil.which("lsusb"):
         res = subprocess.run(["lsusb"], capture_output=True, text=True)
         lower = res.stdout.lower()
@@ -65,11 +93,7 @@ def detect_edl() -> bool:
 
 def detect_adb() -> bool:
     """Check if an ADB device is attached."""
-    adb = shutil.which("adb")
-    if not adb:
-        local_adb = FLASHER_DIR / "temp" / "platform-tools" / "adb"
-        if local_adb.is_file():
-            adb = str(local_adb)
+    adb = find_adb()
     if not adb:
         return False
     res = subprocess.run([adb, "devices"], capture_output=True, text=True)
@@ -92,6 +116,18 @@ def get_device_status() -> str:
     return f"{C_DIM}No device detected (plug dongle or check USB){C_RESET}"
 
 
+def wait_for_edl(timeout_s: int = 40) -> bool:
+    """Wait until EDL 05c6:9008 enumerates on USB."""
+    print(f"{C_GREEN}[*] Waiting for EDL device (05c6:9008)...{C_RESET}")
+    for _ in range(timeout_s):
+        if detect_edl():
+            print(f"{C_GREEN}[*] EDL device detected.{C_RESET}")
+            return True
+        time.sleep(1)
+    print(f"{C_RED}[-] Timed out waiting for EDL 05c6:9008.{C_RESET}")
+    return False
+
+
 def reboot_to_edl() -> int:
     """Attempt to reboot an attached OpenWrt or ADB dongle into EDL 9008."""
     if detect_edl():
@@ -100,20 +136,246 @@ def reboot_to_edl() -> int:
     for host in ("192.168.8.1", "192.168.1.1"):
         if check_tcp(host, 22):
             print(f"{C_GREEN}[*] Sending reboot-edl via SSH ({host})...{C_RESET}")
-            return run_cmd([
-                "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=5",
-                f"root@{host}",
-                "reboot-edl",
-            ])
+            # reboot-edl tears the network down mid-session, so a foreground
+            # ssh never gets a clean close and hangs until TCP times out.
+            # Detach the remote command and let keepalives end the session.
+            try:
+                subprocess.run(
+                    [
+                        "ssh",
+                        "-o", "StrictHostKeyChecking=no",
+                        "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "BatchMode=yes",
+                        "-o", "ConnectTimeout=5",
+                        "-o", "ServerAliveInterval=1",
+                        "-o", "ServerAliveCountMax=2",
+                        f"root@{host}",
+                        "reboot-edl >/dev/null 2>&1 &",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # the link dropped as the dongle rebooted; wait for 9008 below
+            return 0 if wait_for_edl() else 1
     if detect_adb():
-        adb = shutil.which("adb") or str(FLASHER_DIR / "temp" / "platform-tools" / "adb")
-        print(f"{C_GREEN}[*] Rebooting to EDL via ADB...{C_RESET}")
-        return run_cmd([adb, "reboot", "edl"])
-    print(f"{C_RED}[-] No SSH or ADB device found. Hold EDL testpoint/button while plugging USB.{C_RESET}")
+        adb = find_adb()
+        if adb:
+            print(f"{C_GREEN}[*] Rebooting to EDL via ADB...{C_RESET}")
+            subprocess.run([adb, "reboot", "edl"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 0 if wait_for_edl() else 1
+    print(f"{C_RED}[-] No SSH or ADB device found. Short D+ to GND while plugging USB.{C_RESET}")
     return 1
+
+
+def wait_for_dongle(timeout_s: int = 90) -> bool:
+    """Wait for the dongle to show up in any mode (it may still be booting)."""
+    def present() -> bool:
+        return (detect_edl() or check_tcp("192.168.8.1", 22) or check_tcp("192.168.1.1", 22)
+                or detect_adb())
+    if present():
+        return True
+    print(f"{C_GREEN}[*] Waiting for the dongle (booting?) — up to {timeout_s}s...{C_RESET}")
+    end = time.time() + timeout_s
+    while time.time() < end:
+        time.sleep(3)
+        if present():
+            time.sleep(2)  # let SSH finish starting
+            return True
+    return False
+
+
+RADIO_BACKUP = FLASHER_DIR / "radio_backup.py"
+UNITS_DIR = FLASHER_DIR / "backup" / "units"
+EXIT_NOSERIAL = 4  # radio_backup.py: dongle still in firehose, chip serial unknown
+
+
+def debug_mode() -> bool:
+    return os.environ.get("FLASH_DEBUG") == "1"
+
+
+def edl_step(edl: str, label: str, *args: str) -> int:
+    """Run one edl command as a step, minimal-verbose (same renderer as
+    flash-firmware.sh: radio_backup.py view). Raw output in debug mode."""
+    start = time.time()
+    print(f"{C_GREEN}[*]{C_RESET} {label}")
+    try:
+        if debug_mode():
+            rc = subprocess.run([edl, *args]).returncode
+        else:
+            edl_proc = subprocess.Popen([edl, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            subprocess.run([sys.executable, "-I", str(RADIO_BACKUP), "view"], stdin=edl_proc.stdout)
+            edl_proc.stdout.close()
+            rc = edl_proc.wait()
+    except KeyboardInterrupt:
+        print(f"\n{C_YELLOW}[!] Interrupted by user.{C_RESET}")
+        return 130
+    if rc == 0:
+        print(f"      {C_GREEN}✓{C_RESET} {time.time() - start:.0f}s")
+    else:
+        print(f"      {C_RED}✗ failed (edl exit {rc}){C_RESET} — run in debug mode for edl's full output")
+    return rc
+
+
+def ensure_edl_session() -> str | None:
+    """edl binary + dongle in EDL mode, or None (with the reason printed)."""
+    edl = find_edl()
+    if not edl:
+        print(f"{C_RED}[-] edl not found. Run 'Flash OpenWrt' once to install it into ./temp/edl.{C_RESET}")
+        return None
+    if not detect_edl():
+        if not wait_for_dongle():
+            print(f"{C_RED}[-] No dongle found. Plug it in, or short D+ to GND while plugging it "
+                  f"to force EDL.{C_RESET}")
+            return None
+        if reboot_to_edl() != 0:
+            return None
+    return edl
+
+
+def live_backup(edl: str, parts: list[str] | None = None) -> tuple[int, str]:
+    """Back up the connected unit (filed by chip serial). Returns (rc, folder)."""
+    cmd = [sys.executable, "-I", str(RADIO_BACKUP), "backup", "--edl", edl, "--print-path"]
+    if parts:
+        cmd.extend(["--parts", ",".join(parts)])
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    except KeyboardInterrupt:
+        return 130, ""
+    return res.returncode, res.stdout.strip()
+
+
+def handle_firehose_leftover(edl: str) -> None:
+    print(f"{C_YELLOW}[!] The dongle is still in firehose mode from an earlier, interrupted run, so it no "
+          f"longer reports its chip serial. Nothing was written.{C_RESET}")
+    edl_step(edl, "Rebooting the dongle back to its OS", "reset")
+    print(f"{C_YELLOW}[!] Wait ~1 minute for it to boot, then run this again.{C_RESET}")
+
+
+def run_radio_backup(radio_only: bool = False) -> int:
+    """Back up the connected unit: radio + boot chain (12) or radio only (7)."""
+    edl = ensure_edl_session()
+    if not edl:
+        return 1
+    rc, folder = live_backup(edl, RADIO_ONLY_PARTS if radio_only else None)
+    if rc == EXIT_NOSERIAL:
+        handle_firehose_leftover(edl)
+        return rc
+    if rc != 0:
+        print(f"{C_RED}[-] Backup failed.{C_RESET}")
+        return rc
+    try:
+        ans = input("\nReboot the dongle back to its OS now? (Y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    if ans in ("", "y", "yes"):
+        edl_step(edl, "Rebooting the dongle", "reset")
+    return 0
+
+
+def radio_backups() -> list[Path]:
+    """Per-unit backup folders holding all radio partitions, newest first."""
+    found = []
+    if UNITS_DIR.is_dir():
+        for manifest in UNITS_DIR.glob("*/*/manifest.json"):
+            d = manifest.parent
+            if all((d / f"{p}.bin").is_file() for p in RADIO_ONLY_PARTS):
+                found.append(d)
+    return sorted(found, key=lambda d: d.name, reverse=True)
+
+
+def restore_radio_only() -> int:
+    """Write the 7 radio/IMEI partitions from a per-unit backup to the
+    connected dongle. The rest of the flash (firmware, settings) is untouched.
+
+    The connected unit is backed up first (that also reads its chip serial);
+    a backup from another unit clones that unit's IMEI and MAC addresses and
+    needs an explicit YES."""
+    if not radio_backups():
+        print(f"{C_RED}[-] No per-unit radio backups found in {UNITS_DIR.relative_to(FLASHER_DIR)}.{C_RESET}")
+        return 1
+
+    print(f"\n{C_CYAN}=== Restore Radio Only ({', '.join(RADIO_ONLY_PARTS)}) ==={C_RESET}")
+    print("  Writes IMEI / RF data from a backup. Firmware and settings are not touched.")
+    print("  The connected dongle is backed up first, which also tells which unit it is.\n")
+
+    edl = ensure_edl_session()
+    if not edl:
+        return 1
+
+    # Safety copy of what is on the dongle now; also tells us which unit it is.
+    rc, live = live_backup(edl)
+    if rc == EXIT_NOSERIAL:
+        handle_firehose_leftover(edl)
+        return rc
+    if rc != 0 or not live:
+        print(f"{C_RED}[-] Could not back up the connected unit — nothing written.{C_RESET}")
+        return 1
+    this_unit = Path(live).parent.name
+
+    backups = radio_backups()
+    print(f"\n  Connected dongle: unit {C_BOLD}{this_unit}{C_RESET}\n")
+    for i, d in enumerate(backups, 1):
+        mark = ""
+        if d.parent.name == this_unit:
+            mark = f"  {C_GREEN}← this dongle{C_RESET}" + ("  (just taken)" if str(d) == live else "")
+        print(f"  {i:2d}) unit {d.parent.name}   {d.name}{mark}")
+    try:
+        sel = input(f"\nSelect backup to restore [1-{len(backups)}] (Enter = cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sel = ""
+    if not sel.isdigit() or not 1 <= int(sel) <= len(backups):
+        print("Cancelled — nothing written.")
+        edl_step(edl, "Rebooting the dongle", "reset")
+        return 0
+    chosen = backups[int(sel) - 1]
+
+    check = subprocess.run([sys.executable, "-I", str(RADIO_BACKUP), "check", str(chosen), "--against", live])
+    if check.returncode != 0:
+        print(f"\n{C_YELLOW}[!] {chosen.parent.name} is NOT this dongle. Restoring it gives this dongle the same "
+              f"IMEI and Wi-Fi/BT MAC as unit {chosen.parent.name}.{C_RESET}")
+        print(f"{C_YELLOW}    Do not use both on the same operator network at the same time.{C_RESET}")
+        print(f"    To undo later, restore this dongle's own backup: {Path(live).relative_to(FLASHER_DIR)}")
+        try:
+            ans = input("Type YES (capital letters) to restore it anyway: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans != "YES":
+            print("Cancelled — nothing written.")
+            edl_step(edl, "Rebooting the dongle", "reset")
+            return 0
+    else:
+        print(f"{C_GREEN}[*]{C_RESET} Backup belongs to this dongle.")
+
+    for part in RADIO_ONLY_PARTS:
+        if edl_step(edl, f"Restoring {part}", "w", part, str(chosen / f"{part}.bin")) != 0:
+            print(f"{C_RED}[-] Restore of {part} failed. The dongle's previous radio data is in "
+                  f"{Path(live).relative_to(FLASHER_DIR)}.{C_RESET}")
+            return 1
+    edl_step(edl, "Rebooting the dongle", "reset")
+    print(f"\n{C_GREEN}[*] Radio data restored from {chosen.relative_to(FLASHER_DIR)}.{C_RESET}")
+    return 0
+
+
+def list_all_backups() -> int:
+    """List both per-unit radio backups and full stock dumps."""
+    print(f"\n{C_CYAN}=== Per-Unit Radio Backups (backup/units/) ==={C_RESET}")
+    rc = run_cmd([sys.executable, str(FLASHER_DIR / "radio_backup.py"), "list"])
+
+    print(f"\n{C_CYAN}=== Full Stock Dumps (backup/stock-*) ==={C_RESET}")
+    stock_dirs = sorted((FLASHER_DIR / "backup").glob("stock-*")) if (FLASHER_DIR / "backup").is_dir() else []
+    if not stock_dirs:
+        print(f"  {C_DIM}(none){C_RESET}")
+    else:
+        for d in stock_dirs:
+            if d.is_dir():
+                bins = len(list(d.glob("*.bin")))
+                has_sectors = (d / "restore_sectors.txt").is_file()
+                tag = "valid" if has_sectors else "incomplete"
+                print(f"  - {d.relative_to(FLASHER_DIR)}  ({bins} .bin files, {tag})")
+    return rc
 
 
 def open_ssh() -> int:
@@ -151,36 +413,51 @@ def print_banner() -> None:
 def interactive_menu() -> int:
     while True:
         print_banner()
-        print("  1) Flash OpenWrt Firmware (Standard)")
-        print("  2) Flash OpenWrt Firmware (Debug / Verbose EDL)")
-        print("  3) Backup Stock / Full Partitions")
-        print("  4) Restore Stock Firmware")
-        print("  5) List Per-Unit Radio Backups")
-        print("  6) Reboot Dongle to EDL Mode (9008)")
-        print("  7) Open SSH Console (root@192.168.8.1)")
-        print("  0) Exit")
+        dbg = f"{C_YELLOW}ON{C_RESET}" if debug_mode() else f"{C_DIM}off{C_RESET}"
+        print(f"  {C_BOLD}Flash{C_RESET}")
+        print("    1) Flash OpenWrt firmware")
+        print(f"  {C_BOLD}Backup{C_RESET}")
+        print("    2) Back up radio + boot chain    (12 partitions, per unit)")
+        print("    3) Back up radio only            (7 IMEI/RF partitions, per unit)")
+        print("    4) Full stock dump               (all partitions + GPT)")
+        print("    5) List backups")
+        print(f"  {C_BOLD}Restore{C_RESET}")
+        print("    6) Restore radio only            (IMEI/RF from a backup; firmware untouched)")
+        print("    7) Restore stock firmware        (from a full stock dump)")
+        print(f"  {C_BOLD}Tools{C_RESET}")
+        print("    8) Reboot dongle to EDL mode (9008)")
+        print("    9) SSH console (root@192.168.8.1)")
+        print(f"    d) Debug output: {dbg}   (show edl's raw output)")
+        print("    0) Exit")
         print()
 
         try:
-            choice = input("Select action [0-7]: ").strip()
+            choice = input("Select [0-9, d]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
 
         if choice == "1":
-            run_script("flash-firmware.sh")
+            run_script("flash-firmware.sh", ["--debug"] if debug_mode() else None)
         elif choice == "2":
-            run_script("flash-firmware.sh", ["--debug"])
+            run_radio_backup(radio_only=False)
         elif choice == "3":
-            run_script("backup-stock.sh")
+            run_radio_backup(radio_only=True)
         elif choice == "4":
-            run_script("restore-stock.sh")
+            run_script("backup-stock.sh")
         elif choice == "5":
-            run_cmd([sys.executable, str(FLASHER_DIR / "radio_backup.py"), "list"])
+            list_all_backups()
         elif choice == "6":
-            reboot_to_edl()
+            restore_radio_only()
         elif choice == "7":
+            run_script("restore-stock.sh")
+        elif choice == "8":
+            reboot_to_edl()
+        elif choice == "9":
             open_ssh()
+        elif choice == "d":
+            os.environ["FLASH_DEBUG"] = "0" if debug_mode() else "1"
+            continue
         elif choice == "0":
             return 0
         else:
@@ -198,10 +475,13 @@ def parse_args() -> argparse.Namespace:
         description="All-in-One MSM8916 4G Dongle Flasher & Recovery Toolkit"
     )
     parser.add_argument("--flash", action="store_true", help="Run OpenWrt firmware flasher")
-    parser.add_argument("--debug", action="store_true", help="Enable verbose EDL output when flashing")
-    parser.add_argument("--backup-stock", action="store_true", help="Run full stock partition backup")
+    parser.add_argument("--debug", action="store_true", help="Show edl's raw output (any action)")
+    parser.add_argument("--backup-radio", action="store_true", help="Backup radio + boot chain (12 partitions)")
+    parser.add_argument("--backup-radio-only", action="store_true", help="Backup radio/IMEI partitions only (7 partitions)")
+    parser.add_argument("--backup-stock", action="store_true", help="Run full stock partition dump")
     parser.add_argument("--restore-stock", action="store_true", help="Restore stock firmware")
-    parser.add_argument("--list-backups", action="store_true", help="List saved per-unit radio backups")
+    parser.add_argument("--restore-radio", action="store_true", help="Restore radio/IMEI partitions from a per-unit backup")
+    parser.add_argument("--list-backups", action="store_true", help="List saved radio & full stock backups")
     parser.add_argument("--edl", action="store_true", help="Reboot connected dongle into EDL mode")
     parser.add_argument("--ssh", action="store_true", help="Open SSH session to modem")
     return parser.parse_args()
@@ -210,15 +490,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     os.chdir(FLASHER_DIR)
     args = parse_args()
+    if args.debug:
+        os.environ["FLASH_DEBUG"] = "1"
 
     if args.flash:
         return run_script("flash-firmware.sh", ["--debug"] if args.debug else None)
+    if args.backup_radio:
+        return run_radio_backup(radio_only=False)
+    if args.backup_radio_only:
+        return run_radio_backup(radio_only=True)
     if args.backup_stock:
         return run_script("backup-stock.sh")
     if args.restore_stock:
         return run_script("restore-stock.sh")
+    if args.restore_radio:
+        return restore_radio_only()
     if args.list_backups:
-        return run_cmd([sys.executable, str(FLASHER_DIR / "radio_backup.py"), "list"])
+        return list_all_backups()
     if args.edl:
         return reboot_to_edl()
     if args.ssh:
