@@ -65,6 +65,13 @@ var callSetBandLock = rpc.declare({
 	expect: { '': {} }
 });
 
+var callSetNetworkSelection = rpc.declare({
+	object: 'luci.proton-system',
+	method: 'setNetworkSelection',
+	params: [ 'mode', 'plmn' ],
+	expect: { '': {} }
+});
+
 var ALL_BANDS = [
 	{ id: 'eutran-1', name: 'LTE Band 1 (2100 MHz)', telco: 'Indosat, Telkomsel, XL', type: 'FDD' },
 	{ id: 'eutran-3', name: 'LTE Band 3 (1800 MHz)', telco: 'Indosat, Telkomsel, XL, Smartfren', type: 'FDD' },
@@ -364,6 +371,23 @@ return view.extend({
 		var elWd = document.getElementById('rf-watchdog-val');
 		if (elWd) elWd.textContent = hw.watchdog || '--';
 
+		// 4b. Network selection status (the form itself is left alone so a
+		// half-edited choice is not overwritten by the 3 s poll)
+		var ns = data.netselect || {};
+		var elNs = document.getElementById('rf-netsel-status');
+		if (elNs) {
+			var nsText;
+			if (ns.mode === 'manual')
+				nsText = _('Locked to %s.').format(plmnLabel(ns.plmn));
+			else if (ns.mode === 'auto')
+				nsText = _('Automatic: any network this SIM is allowed on.');
+			else
+				nsText = ns.home_plmn
+					? _('Home network only: %s, read from the SIM. Falls back to automatic if it cannot register there.').format(plmnLabel(ns.home_plmn))
+					: _('Home network only (SIM operator not readable yet; automatic until it is).');
+			elNs.textContent = nsText;
+		}
+
 		// 5. Active Locked Band Status Badge
 		var elLockBadge = document.getElementById('rf-locked-status-badge');
 		if (elLockBadge) {
@@ -552,6 +576,56 @@ return view.extend({
 			{ label: 'Lock B1 + B3', bands: 'eutran-1|eutran-3' },
 			{ label: 'Lock B3 + B8', bands: 'eutran-3|eutran-8' }
 		];
+
+		// Network selection card
+		var ns0 = (initialData && initialData.netselect) || {};
+		var nsPlmnInput = E('input', {
+			'type': 'text', 'class': 'cbi-input-text', 'id': 'rf-netsel-plmn',
+			'placeholder': _('MCC+MNC, e.g. 51001'), 'maxlength': 6,
+			'value': ns0.mode === 'manual' ? (ns0.plmn || '') : '',
+			'style': 'width: 150px; font-family: monospace;' + (ns0.mode === 'manual' ? '' : ' display: none;')
+		});
+		var nsSelect = E('select', {
+			'class': 'cbi-input-select', 'id': 'rf-netsel-mode',
+			'change': function(ev) { nsPlmnInput.style.display = (ev.target.value === 'manual') ? '' : 'none'; }
+		}, [
+			E('option', { 'value': 'home' }, _('Home network only (fast)')),
+			E('option', { 'value': 'auto' }, _('Automatic (any allowed network)')),
+			E('option', { 'value': 'manual' }, _('Manual (specific PLMN)'))
+		]);
+		nsSelect.value = ns0.mode || 'home';
+
+		var networkSelectionCard = E('div', { 'class': 'cbi-section rf-cockpit-card', 'style': 'margin-bottom: 14px; padding: 16px 18px;' }, [
+			E('h3', { 'style': 'margin: 0 0 6px; font-size: 14px;' }, _('Network Selection')),
+			E('div', { 'class': 'cbi-map-descr', 'style': 'margin-bottom: 10px;' },
+				_('"Home network only" registers only in the network of the inserted SIM, like a phone: the modem does not sit on a stronger foreign cell with emergency-only service, so it reconnects faster. Use "Automatic" for SIMs that rely on a partner network.')),
+			E('div', { 'style': 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
+				nsSelect,
+				nsPlmnInput,
+				E('button', {
+					'class': 'cbi-button cbi-button-apply',
+					'click': function(ev) {
+						ev.preventDefault();
+						var mode = nsSelect.value;
+						var plmn = (mode === 'manual') ? nsPlmnInput.value.trim() : '';
+						if (mode === 'manual' && !/^[0-9]{5,6}$/.test(plmn)) {
+							self.showPushToast('error', _('Invalid PLMN'), _('Enter the 5 or 6 digit MCC+MNC, e.g. 51001.'));
+							return;
+						}
+						self.showPushToast('loading', _('Applying network selection...'), _('The modem interface restarts and registers again; this can take up to a minute.'));
+						callSetNetworkSelection(mode, plmn).then(function(res) {
+							if (res && res.success)
+								self.showPushToast('success', _('Network selection saved'), _('Reconnecting the modem now.'));
+							else
+								self.showPushToast('error', _('Network selection failed'), (res && res.error) || _('Unknown error'));
+						}).catch(function(err) {
+							self.showPushToast('error', _('RPC Communication Error'), err.message || err);
+						});
+					}
+				}, _('Apply'))
+			]),
+			E('div', { 'id': 'rf-netsel-status', 'style': 'margin-top: 8px; font-size: 12px; color: var(--text-color-medium);' }, '--')
+		]);
 
 		var presetButtons = E('div', {
 			'style': 'display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0;'
@@ -750,7 +824,7 @@ return view.extend({
 						createGaugeRow(_('SINR / SNR'), _('Signal-to-Noise'), 'rf-sinr-val', 'rf-sinr-badge', 'rf-sinr-bar', _('Min: -15 dB'), _('Max: +25 dB')),
 						createGaugeRow(_('RSRQ'), _('Quality'), 'rf-rsrq-val', 'rf-rsrq-badge', 'rf-rsrq-bar', _('Min: -20 dB'), _('Max: -3 dB')),
 						createGaugeRow(_('RSSI'), _('Carrier Power'), 'rf-rssi-val', 'rf-rssi-badge', 'rf-rssi-bar', _('Min: -110 dBm'), _('Max: -50 dBm')),
-						createGaugeRow(_('Signal Level'), _('CSQ Scale'), 'rf-csq-val', 'rf-csq-badge', 'rf-csq-bar', _('Min: 0'), _('Max: 31'), true)
+						createGaugeRow(_('Signal Level'), _('CSQ · RSSI, includes noise'), 'rf-csq-val', 'rf-csq-badge', 'rf-csq-bar', _('Min: 0'), _('Max: 31'), true)
 					])
 				])
 			]),
@@ -786,6 +860,9 @@ return view.extend({
 					])
 				])
 			]),
+
+			// 3b. Network selection (home network only / automatic / manual PLMN)
+			networkSelectionCard,
 
 			// 4. Row 3: LTE Band Locking Controls
 			E('div', { 'class': 'cbi-section rf-cockpit-card', 'style': 'margin-bottom: 14px; padding: 16px 18px;' }, [

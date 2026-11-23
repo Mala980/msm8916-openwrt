@@ -699,6 +699,51 @@ function parseServingSystem() {
 	return r;
 }
 
+// Network selection (see netselect in /lib/netifd/proto/modemmanager.sh):
+// "home" (default) = only the SIM's own network, "auto", "manual" = 'plmn'.
+const THREE_DIGIT_MNC_MCC = [ "302", "310", "311", "312", "313", "314", "315", "316", "334", "338", "342", "344", "346", "348", "350", "352", "354", "356", "358", "360", "365", "366", "376", "708", "722", "732" ];
+
+function homePlmnFromImsi(imsi) {
+	if (!match(imsi || "", /^[0-9]{6,15}$/)) return "";
+	let mcc = substr(imsi, 0, 3);
+	return substr(imsi, 0, (index(THREE_DIGIT_MNC_MCC, mcc) >= 0) ? 6 : 5);
+}
+
+function getNetworkSelection(imsi) {
+	let mode = "", plmn = "";
+	try {
+		let u = cursor();
+		u.load("network");
+		mode = u.get("network", "modem", "netselect") || "";
+		plmn = u.get("network", "modem", "plmn") || "";
+	} catch(e) {}
+	if (mode == "") mode = (plmn != "") ? "manual" : "home";
+	return { mode: mode, plmn: plmn, home_plmn: homePlmnFromImsi(imsi) };
+}
+
+function setNetworkSelection(params) {
+	let mode = params ? params.mode : null;
+	let plmn = params ? (params.plmn || "") : "";
+	if (mode != "home" && mode != "auto" && mode != "manual")
+		return { success: false, error: "mode must be home, auto or manual" };
+	if (mode == "manual" && !match(plmn, /^[0-9]{5,6}$/))
+		return { success: false, error: "manual mode needs a 5 or 6 digit PLMN (MCC+MNC)" };
+
+	let u = cursor();
+	u.load("network");
+	if (!u.get("network", "modem"))
+		return { success: false, error: "no network.modem interface" };
+	u.set("network", "modem", "netselect", mode);
+	if (mode == "manual") u.set("network", "modem", "plmn", plmn);
+	else u.delete("network", "modem", "plmn");
+	u.commit("network");
+
+	// A new choice starts with a clean home-network failure count, then the
+	// modem interface setup is re-run so it applies now.
+	system("rm -f /tmp/mm-netselect-modem; (ifup modem) >/dev/null 2>&1 &");
+	return { success: true, mode: mode, plmn: (mode == "manual") ? plmn : "" };
+}
+
 function getSignalDetails() {
 	let cell_res = parseCellInfo();
 	let sig_res = parseSignalInfo();
@@ -774,6 +819,7 @@ function getSignalDetails() {
 			registered: registered
 		},
 		registration: reg,
+		netselect: getNetworkSelection(hw.imsi),
 		signal: {
 			percent: sig_quality,
 			csq: csq,
@@ -1015,6 +1061,12 @@ const methods = {
 		args: { bands: "string" },
 		call: function(req) {
 			return setBandLock(req.args);
+		}
+	},
+	setNetworkSelection: {
+		args: { mode: "string", plmn: "string" },
+		call: function(req) {
+			return setNetworkSelection(req.args);
 		}
 	},
 	startSpeedtest: {

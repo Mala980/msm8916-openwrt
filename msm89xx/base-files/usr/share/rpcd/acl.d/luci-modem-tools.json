@@ -13,6 +13,7 @@
 					"getTTL",
 					"setTTL",
 					"setBandLock",
+					"setNetworkSelection",
 					"startSpeedtest",
 					"getSpeedtestStatus",
 					"getSpeedtestHistory",
@@ -30,6 +31,7 @@
 			"ubus": {
 				"luci.proton-system": [
 					"setBandLock",
+					"setNetworkSelection",
 					"startSpeedtest",
 					"cancelSpeedtest",
 					"clearSpeedtestHistory"

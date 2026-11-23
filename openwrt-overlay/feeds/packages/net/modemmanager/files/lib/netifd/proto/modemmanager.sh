@@ -278,6 +278,7 @@ proto_modemmanager_init_config() {
 	proto_config_add_string iptype
 	proto_config_add_boolean sourcefilter
 	proto_config_add_string plmn
+	proto_config_add_string netselect
 	proto_config_add_int signalrate
 	proto_config_add_boolean lowpower
 	proto_config_add_boolean allow_roaming
@@ -564,6 +565,128 @@ modemmanager_set_plmn() {
 	}
 }
 
+# Home PLMN (MCC+MNC) of the inserted SIM: the SIM's own operator code when
+# ModemManager reports it (EF_AD-aware), else the IMSI prefix -- 5 digits, or
+# 6 for countries whose operators use 3-digit MNCs.
+modemmanager_home_plmn() {
+	local device="$1"
+	local kv code imsi mcc
+
+	kv="$(mmcli --modem="${device}" --sim=any --output-keyvalue 2>/dev/null)"
+	[ -n "$kv" ] || kv="$(mmcli --sim=any --output-keyvalue 2>/dev/null)"
+
+	code="$(echo "$kv" | sed -n 's/^sim\.properties\.operator-code *: *\([0-9]\{5,6\}\)$/\1/p')"
+	[ -n "$code" ] && { echo "$code"; return 0; }
+
+	imsi="$(echo "$kv" | sed -n 's/^sim\.properties\.imsi *: *\([0-9]\{6,15\}\)$/\1/p')"
+	[ -n "$imsi" ] || return 1
+
+	mcc="${imsi%"${imsi#???}"}"
+	case "$mcc" in
+		302|310|311|312|313|314|315|316|334|338|342|344|346|348|350|352|354|356|358|360|365|366|376|708|722|732)
+			echo "${imsi%"${imsi#??????}"}" ;;
+		*)
+			echo "${imsi%"${imsi#?????}"}" ;;
+	esac
+}
+
+# Network selection, like a phone:
+#   home   (default) register only in the SIM's own network, so the modem does
+#          not sit on a stronger foreign cell for emergency-only service and
+#          reconnects faster. If the home network is not found the modem stays
+#          locked to it and keeps searching (it is usually just weak); only
+#          after max_fails (5) consecutive failed setups -- a SIM
+#          that lives on a partner network -- does it switch to automatic,
+#          until a registration succeeds, the SIM changes or the setting is
+#          changed (/tmp/mm-netselect-<interface> holds "<plmn> <fails>").
+#   auto   automatic selection, any network the SIM is allowed on.
+#   manual register only in the PLMN given in 'plmn'.
+# A 'plmn' with no 'netselect' keeps the old meaning: manual.
+modemmanager_network_select() {
+	local device="$1"
+	local interface="$2"
+	local netselect="$3"
+	local plmn="$4"
+	local force_connection="$5"
+	local home state fails=0 max_fails=5
+
+	[ -n "$netselect" ] || { [ -n "$plmn" ] && netselect="manual" || netselect="home"; }
+
+	case "$netselect" in
+		manual)
+			[ -n "$plmn" ] || {
+				echo "netselect 'manual' without a plmn -> automatic selection"
+				netselect="auto"
+			}
+			;;
+		home)
+			state="${NETSELECT_STATE_DIR:-/tmp}/mm-netselect-${interface}"
+			home="$(modemmanager_home_plmn "$device")"
+			if [ -z "$home" ]; then
+				echo "home network: SIM operator unknown -> automatic selection"
+				netselect="auto"
+			else
+				# failure count only applies to the same SIM network
+				[ -r "$state" ] && set -- $(cat "$state") && [ "$1" = "$home" ] && fails="${2:-0}"
+				case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+
+				if [ "$fails" -ge "$max_fails" ]; then
+					echo "home network ${home} failed ${fails} times in a row -> automatic selection"
+					netselect="auto"
+				else
+					echo "registering in the SIM's home network ${home}..."
+					if mmcli --modem="${device}" --timeout 90 \
+						--3gpp-register-in-operator="${home}" >/dev/null 2>&1; then
+						echo "registered in home network ${home}"
+						rm -f "$state"
+						return 0
+					fi
+					fails=$((fails + 1))
+					echo "$home $fails" > "$state"
+					if [ "$fails" -ge "$max_fails" ]; then
+						echo "home network ${home} not found ${fails} times in a row -> automatic selection"
+						netselect="auto"
+					else
+						echo "home network ${home} not found yet (${fails}/${max_fails}); staying on it"
+						return 0
+					fi
+				fi
+			fi
+			;;
+		auto) ;;
+		*)
+			echo "unknown netselect '${netselect}' -> automatic selection"
+			netselect="auto"
+			;;
+	esac
+
+	if [ "$netselect" = "manual" ]; then
+		echo "starting network registration with plmn '${plmn}'..."
+		modemmanager_set_plmn "$device" "$interface" "$plmn" "$force_connection"
+		return $?
+	fi
+
+	# The modem keeps a manual selection across restarts, so put it back to
+	# automatic explicitly. A failure here (no network yet) is not fatal: the
+	# connect step below waits for registration.
+	mmcli --modem="${device}" --timeout 30 --3gpp-register-home >/dev/null 2>&1 ||
+		echo "automatic network selection request failed (continuing)"
+	return 0
+}
+
+modemmanager_netselect_connected() {
+	local device="$1"
+	local interface="$2"
+	local state="${NETSELECT_STATE_DIR:-/tmp}/mm-netselect-${interface}"
+	local home op
+
+	[ -r "$state" ] || return 0
+	home="$(cut -d' ' -f1 "$state")"
+	op="$(mmcli --modem="${device}" --output-keyvalue 2>/dev/null | sed -n 's/^modem\.3gpp\.operator-code *: *\([0-9]\{5,6\}\)$/\1/p')"
+	[ -n "$home" ] && [ "$op" = "$home" ] && rm -f "$state"
+	return 0
+}
+
 proto_modemmanager_setup() {
 	local interface="$1"
 
@@ -573,7 +696,7 @@ proto_modemmanager_setup() {
 	local allowedmode preferredmode
 
 	local device apn allowedauth username password pincode
-	local iptype plmn metric signalrate allow_roaming
+	local iptype plmn netselect metric signalrate allow_roaming
 	local force_connection
 
 	local init_epsbearer
@@ -583,7 +706,7 @@ proto_modemmanager_setup() {
 	local address prefix gateway mtu dns1 dns2
 
 	json_get_vars device apn allowedauth username password
-	json_get_vars pincode iptype sourcefilter plmn metric signalrate allow_roaming
+	json_get_vars pincode iptype sourcefilter plmn netselect metric signalrate allow_roaming
 	json_get_vars allowedmode preferredmode force_connection
 
 	json_get_vars init_epsbearer
@@ -690,14 +813,8 @@ proto_modemmanager_setup() {
 		[ "$?" -ne "0" ] && return 1
 	fi
 
-	if [ -z "${plmn}" ]; then
-		modemmanager_set_plmn "$device" "$interface" "" "$force_connection"
-		[ "$?" -ne "0" ] && return 1
-	else
-		echo "starting network registration with plmn '${plmn}'..."
-		modemmanager_set_plmn "$device" "$interface" "$plmn" "$force_connection"
-		[ "$?" -ne "0" ] && return 1
-	fi
+	modemmanager_network_select "$device" "$interface" "$netselect" "$plmn" "$force_connection"
+	[ "$?" -ne "0" ] && return 1
 
 	# setup connect args; APN mandatory (even if it may be empty)
 	echo "starting connection with apn '${apn}'..."
@@ -734,6 +851,10 @@ proto_modemmanager_setup() {
 		fi
 		return 1
 	}
+
+	# Connected in the SIM's home network: reset the home-network failure
+	# count, even if registration only completed during the connect wait.
+	modemmanager_netselect_connected "$device" "$interface"
 
 	# check if Signal refresh rate is set
 	if [ -n "${signalrate}" ] && [ "${signalrate}" -eq "${signalrate}" ] 2>/dev/null; then

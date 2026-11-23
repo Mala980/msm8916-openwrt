@@ -13,6 +13,7 @@
                     "getTelemetry",
                     "getSignalDetails",
                     "setBandLock",
+                    "setNetworkSelection",
                     "startSpeedtest",
                     "getSpeedtestStatus",
                     "getSpeedtestHistory",
@@ -62,7 +63,8 @@
         "write": {
             "ubus": {
                 "luci.proton-system": [
-                    "setBandLock"
+                    "setBandLock",
+                    "setNetworkSelection"
                 ],
                 "luci.proton-temp": [
                     "setThresholds"
