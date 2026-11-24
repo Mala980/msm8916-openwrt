@@ -552,7 +552,84 @@ def _find_openwrt_host() -> str | None:
     return None
 
 
-def verify_openwrt_dongle(wait_for_boot: bool = True, timeout_s: int = 120) -> int:
+def _ssh_opts(convert_mod) -> list[str]:
+    return convert_mod.SSH_OPTS + ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
+
+
+def ask_disable_wifi() -> bool:
+    """Ask whether to disable Wi-Fi after OpenWrt boots (default: disable)."""
+    print("\nDisable Wi-Fi radio after boot? (saves power & heat; recommended for USB/MikroTik)")
+    print("  1) Disable Wi-Fi (default - cooler & lower current)")
+    print("  2) Keep Wi-Fi enabled (AP mode)")
+    try:
+        sel = input("Select Wi-Fi mode [1/2] (default 1): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return True
+    return sel != "2"
+
+
+def set_wifi_enabled(host: str, enabled: bool) -> int:
+    """Enable or disable wireless.radio0 over SSH and sync to overlay."""
+    import convert
+
+    disabled_val = "0" if enabled else "1"
+    action_label = "Enabling Wi-Fi (AP mode)" if enabled else "Disabling Wi-Fi (power-saving)"
+    print(f"{C_GREEN}[*]{C_RESET} {action_label} on {host}...")
+    cmd_str = (
+        "if [ -x /etc/init.d/msm-firmware-dumper ]; then "
+        "for i in $(seq 1 45); do [ -f /lib/firmware/DUMPED ] && break; sleep 1; done; "
+        "fi; "
+        "for i in $(seq 1 20); do uci -q get wireless.radio0 >/dev/null 2>&1 && break; sleep 2; done; "
+        + (
+            "if grep -q 'disabled=.*0' /etc/hotplug.d/ieee80211/99-wifi-led 2>/dev/null; then "
+            "printf '#!/bin/sh\\nexit 0\\n' > /etc/hotplug.d/ieee80211/99-wifi-led; "
+            "fi; "
+            if not enabled else ""
+        )
+        + f"uci set wireless.radio0.disabled='{disabled_val}'; "
+        f"uci set wireless.default_radio0.disabled='{disabled_val}' 2>/dev/null || true; "
+        "uci commit wireless; "
+        "wifi reload 2>/dev/null || true; "
+        "sync"
+    )
+    try:
+        res = subprocess.run(
+            ["ssh"] + _ssh_opts(convert) + [f"root@{host}", cmd_str],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{C_RED}[-] Failed to update Wi-Fi state: {exc}{C_RESET}")
+        return 1
+    if res.returncode != 0:
+        err = res.stderr.strip() or f"ssh exited {res.returncode}"
+        print(f"{C_RED}[-] Failed to update Wi-Fi state: {err}{C_RESET}")
+        return 1
+    return 0
+
+
+def configure_wifi_menu(enabled: bool | None = None) -> int:
+    """Disable or enable Wi-Fi on an online OpenWrt dongle."""
+    host = _find_openwrt_host()
+    if not host:
+        print(f"{C_RED}[-] OpenWrt SSH not reachable on 192.168.8.1 or 192.168.1.1.{C_RESET}")
+        return 1
+    if enabled is None:
+        enabled = not ask_disable_wifi()
+    rc = set_wifi_enabled(host, enabled=enabled)
+    if rc == 0:
+        state = "enabled" if enabled else "disabled (power-saving)"
+        print(f"{C_GREEN}[*]{C_RESET} Wi-Fi is now {state} and synced to flash.")
+    return rc
+
+
+def verify_openwrt_dongle(
+    wait_for_boot: bool = True,
+    timeout_s: int = 120,
+    disable_wifi: bool | None = None,
+) -> int:
     """Wait for OpenWrt SSH and verify modem, IMEI, Wi-Fi, and web UI."""
     import convert
 
@@ -573,15 +650,30 @@ def verify_openwrt_dongle(wait_for_boot: bool = True, timeout_s: int = 120) -> i
         print(f"{C_RED}[-] OpenWrt SSH not reachable on 192.168.8.1 or 192.168.1.1.{C_RESET}")
         return 1
 
+    if disable_wifi is True:
+        if set_wifi_enabled(host, enabled=False) != 0:
+            return 1
+    elif disable_wifi is False:
+        if set_wifi_enabled(host, enabled=True) != 0:
+            return 1
+
     print(f"\n{C_CYAN}=== Verifying OpenWrt Dongle ({host}) ==={C_RESET}")
     script = (
-        convert.VERIFY_SCRIPT
-        + '; echo RELEASE=$(. /etc/openwrt_release 2>/dev/null && printf "%s" "$DISTRIB_DESCRIPTION")'
-        + '; sync'
+        "for i in $(seq 1 30); do mmcli -L 2>/dev/null | grep -q Modem/ && break; sleep 3; done; "
+        "WIFI_DIS=$(uci -q get wireless.radio0.disabled 2>/dev/null || echo 0); "
+        "if [ \"$WIFI_DIS\" != 1 ]; then "
+        "for i in $(seq 1 20); do [ \"$(wifi status 2>/dev/null | jsonfilter -e @.radio0.up)\" = true ] && break; sleep 3; done; "
+        "fi; "
+        "echo IMEI=$(qmicli -p -d /dev/wwan0qmi0 --dms-get-ids 2>/dev/null | sed -n \"s/.*IMEI: '\\([0-9]*\\)'.*/\\1/p\"); "
+        "echo WIFI=$([ \"$(wifi status 2>/dev/null | jsonfilter -e @.radio0.up)\" = true ] && echo 1 || echo 0); "
+        "echo WIFI_DISABLED=$WIFI_DIS; "
+        "echo MODEM=$(mmcli -L 2>/dev/null | grep -o '/org/freedesktop/ModemManager1/Modem/[0-9]*' | head -n 1); "
+        "echo RELEASE=$(. /etc/openwrt_release 2>/dev/null && printf \"%s\" \"$DISTRIB_DESCRIPTION\"); "
+        "sync"
     )
     try:
         res = subprocess.run(
-            ["ssh"] + convert.SSH_OPTS + [f"root@{host}", script],
+            ["ssh"] + _ssh_opts(convert) + [f"root@{host}", script],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -603,6 +695,7 @@ def verify_openwrt_dongle(wait_for_boot: bool = True, timeout_s: int = 120) -> i
     kv = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
     release = kv.get("RELEASE", "").strip()
     modem_path = kv.get("MODEM", "").strip()
+    wifi_disabled = kv.get("WIFI_DISABLED", "0").strip() == "1"
     web_up = check_tcp(host, 80)
 
     if release:
@@ -611,9 +704,14 @@ def verify_openwrt_dongle(wait_for_boot: bool = True, timeout_s: int = 120) -> i
     print(f"  Web UI  : http://{host} " + (f"{C_GREEN}✓{C_RESET}" if web_up else f"{C_YELLOW}! port 80 not listening{C_RESET}"))
     print("  Modem   : " + (f"{modem_path} {C_GREEN}✓{C_RESET}" if parsed["modem_present"] else f"{C_RED}✗ missing{C_RESET}"))
     print("  IMEI    : " + (f"{parsed['imei']} {C_GREEN}✓{C_RESET}" if parsed["imei"] else f"{C_RED}✗ empty / unreadable{C_RESET}"))
-    print("  Wi-Fi   : " + (f"radio0 up {C_GREEN}✓{C_RESET}" if parsed["wifi_up"] else f"{C_RED}✗ down{C_RESET}"))
+    if wifi_disabled:
+        wifi_ok = True
+        print(f"  Wi-Fi   : disabled (power-saving) {C_GREEN}✓{C_RESET}")
+    else:
+        wifi_ok = parsed["wifi_up"]
+        print("  Wi-Fi   : " + (f"radio0 up {C_GREEN}✓{C_RESET}" if parsed["wifi_up"] else f"{C_RED}✗ down{C_RESET}"))
 
-    ok = parsed["modem_present"] and bool(parsed["imei"]) and parsed["wifi_up"]
+    ok = parsed["modem_present"] and bool(parsed["imei"]) and wifi_ok
     if ok:
         print(f"{C_GREEN}[*] OpenWrt verification passed.{C_RESET}")
         return 0
@@ -695,19 +793,21 @@ def interactive_menu() -> int:
         print("    8) Reboot dongle to EDL mode (9008)")
         print("    9) SSH console (root@192.168.8.1)")
         print("    v) Verify OpenWrt & backups    (IMEI, modem, Wi-Fi, web UI + backup SHA-256)")
+        print("    w) Disable / enable Wi-Fi      (save power & heat on connected dongle)")
         print(f"    d) Debug output: {dbg}   (show edl's raw output)")
         print("    0) Exit")
         print()
 
         try:
-            choice = input("Select [0-9, c, v, d]: ").strip().lower()
+            choice = input("Select [0-9, c, v, w, d]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
 
         if choice == "1":
+            disable_wifi = ask_disable_wifi()
             if run_script("flash-firmware.sh", ["--debug"] if debug_mode() else None) == 0:
-                verify_openwrt_dongle(wait_for_boot=True, timeout_s=120)
+                verify_openwrt_dongle(wait_for_boot=True, timeout_s=120, disable_wifi=disable_wifi)
         elif choice == "c":
             run_convert()
         elif choice == "2":
@@ -728,6 +828,8 @@ def interactive_menu() -> int:
             open_ssh()
         elif choice == "v":
             run_verify(wait_for_boot=True)
+        elif choice == "w":
+            configure_wifi_menu()
         elif choice == "d":
             os.environ["FLASH_DEBUG"] = "0" if debug_mode() else "1"
             continue
@@ -748,6 +850,8 @@ def parse_args() -> argparse.Namespace:
         description="All-in-One MSM8916 4G Dongle Flasher & Recovery Toolkit"
     )
     parser.add_argument("--flash", action="store_true", help="Run OpenWrt firmware flasher")
+    parser.add_argument("--keep-wifi", action="store_true", help="Keep Wi-Fi enabled after --flash (default disables Wi-Fi)")
+    parser.add_argument("--wifi", choices=("off", "on"), help="Disable or enable Wi-Fi on connected OpenWrt dongle")
     parser.add_argument("--no-verify", action="store_true", help="Skip post-flash OpenWrt verification with --flash")
     parser.add_argument("--verify", action="store_true", help="Verify booted OpenWrt dongle (IMEI, modem, Wi-Fi) and saved backups")
     parser.add_argument("--convert", action="store_true",
@@ -775,8 +879,10 @@ def main() -> int:
     if args.flash:
         rc = run_script("flash-firmware.sh", ["--debug"] if args.debug else None)
         if rc == 0 and not args.no_verify:
-            return verify_openwrt_dongle(wait_for_boot=True, timeout_s=120)
+            return verify_openwrt_dongle(wait_for_boot=True, timeout_s=120, disable_wifi=not args.keep_wifi)
         return rc
+    if args.wifi:
+        return configure_wifi_menu(enabled=(args.wifi == "on"))
     if args.verify:
         return run_verify(wait_for_boot=False)
     if args.backup_radio:

@@ -35,11 +35,36 @@ class FlasherVerifyTest(unittest.TestCase):
              redirect_stdout(buf):
             rc = flasher.verify_openwrt_dongle(wait_for_boot=False)
         self.assertEqual(rc, 0)
-        self.assertIn("; sync", run_mock.call_args[0][0][-1])
+        self.assertIn("sync", run_mock.call_args[0][0][-1])
         out = buf.getvalue()
         self.assertIn("860018046041589", out)
         self.assertIn("OpenWrt 24.10.0", out)
         self.assertIn("verification passed", out)
+
+    def test_verify_openwrt_dongle_accepts_intentionally_disabled_wifi(self):
+        ssh_out = (
+            "IMEI=860018046041589\n"
+            "WIFI=0\n"
+            "WIFI_DISABLED=1\n"
+            "MODEM=/org/freedesktop/ModemManager1/Modem/0\n"
+            "RELEASE=OpenWrt 24.10.0\n"
+        )
+        fake_res = subprocess.CompletedProcess(["ssh"], 0, stdout=ssh_out, stderr="")
+        buf = io.StringIO()
+        with mock.patch.object(flasher, "check_tcp", side_effect=lambda h, p: h == "192.168.8.1" and p in (22, 80)), \
+             mock.patch.object(flasher.subprocess, "run", return_value=fake_res), \
+             redirect_stdout(buf):
+            rc = flasher.verify_openwrt_dongle(wait_for_boot=False, disable_wifi=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("disabled (power-saving)", buf.getvalue())
+
+    def test_ask_disable_wifi_defaults_to_true(self):
+        with mock.patch("builtins.input", return_value=""):
+            self.assertTrue(flasher.ask_disable_wifi())
+        with mock.patch("builtins.input", return_value="1"):
+            self.assertTrue(flasher.ask_disable_wifi())
+        with mock.patch("builtins.input", return_value="2"):
+            self.assertFalse(flasher.ask_disable_wifi())
 
     def test_verify_openwrt_dongle_fails_when_imei_missing(self):
         ssh_out = "IMEI=\nWIFI=1\nMODEM=/org/freedesktop/ModemManager1/Modem/0\n"
