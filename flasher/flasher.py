@@ -544,6 +544,115 @@ def open_ssh() -> int:
     return 1
 
 
+def _find_openwrt_host() -> str | None:
+    """Return the first OpenWrt host whose SSH port is reachable."""
+    for host in ("192.168.8.1", "192.168.1.1"):
+        if check_tcp(host, 22):
+            return host
+    return None
+
+
+def verify_openwrt_dongle(wait_for_boot: bool = True, timeout_s: int = 120) -> int:
+    """Wait for OpenWrt SSH and verify modem, IMEI, Wi-Fi, and web UI."""
+    import convert
+
+    host = _find_openwrt_host()
+    if not host and wait_for_boot:
+        print(f"{C_GREEN}[*] Waiting for OpenWrt to boot on 192.168.8.1 (up to {timeout_s}s, Ctrl-C to skip)...{C_RESET}")
+        end = time.time() + timeout_s
+        try:
+            while time.time() < end:
+                host = _find_openwrt_host()
+                if host:
+                    break
+                time.sleep(2)
+        except KeyboardInterrupt:
+            print(f"\n{C_YELLOW}[!] Verification skipped by user.{C_RESET}")
+            return 0
+    if not host:
+        print(f"{C_RED}[-] OpenWrt SSH not reachable on 192.168.8.1 or 192.168.1.1.{C_RESET}")
+        return 1
+
+    print(f"\n{C_CYAN}=== Verifying OpenWrt Dongle ({host}) ==={C_RESET}")
+    script = (
+        convert.VERIFY_SCRIPT
+        + '; echo RELEASE=$(. /etc/openwrt_release 2>/dev/null && printf "%s" "$DISTRIB_DESCRIPTION")'
+    )
+    try:
+        res = subprocess.run(
+            ["ssh"] + convert.SSH_OPTS + [f"root@{host}", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
+        )
+    except KeyboardInterrupt:
+        print(f"\n{C_YELLOW}[!] Verification skipped by user.{C_RESET}")
+        return 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{C_RED}[-] SSH verify failed: {exc}{C_RESET}")
+        return 1
+
+    if res.returncode != 0 and not res.stdout.strip():
+        err = res.stderr.strip() or f"ssh exited {res.returncode}"
+        print(f"{C_RED}[-] SSH verify error: {err}{C_RESET}")
+        return 1
+
+    parsed = convert.parse_verify(res.stdout)
+    kv = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
+    release = kv.get("RELEASE", "").strip()
+    modem_path = kv.get("MODEM", "").strip()
+    web_up = check_tcp(host, 80)
+
+    if release:
+        print(f"  Release : {release}")
+    print(f"  SSH     : root@{host} {C_GREEN}✓{C_RESET}")
+    print(f"  Web UI  : http://{host} " + (f"{C_GREEN}✓{C_RESET}" if web_up else f"{C_YELLOW}! port 80 not listening{C_RESET}"))
+    print("  Modem   : " + (f"{modem_path} {C_GREEN}✓{C_RESET}" if parsed["modem_present"] else f"{C_RED}✗ missing{C_RESET}"))
+    print("  IMEI    : " + (f"{parsed['imei']} {C_GREEN}✓{C_RESET}" if parsed["imei"] else f"{C_RED}✗ empty / unreadable{C_RESET}"))
+    print("  Wi-Fi   : " + (f"radio0 up {C_GREEN}✓{C_RESET}" if parsed["wifi_up"] else f"{C_RED}✗ down{C_RESET}"))
+
+    ok = parsed["modem_present"] and bool(parsed["imei"]) and parsed["wifi_up"]
+    if ok:
+        print(f"{C_GREEN}[*] OpenWrt verification passed.{C_RESET}")
+        return 0
+    print(f"{C_RED}[-] OpenWrt verification failed — check modem/IMEI/Wi-Fi above.{C_RESET}")
+    return 1
+
+
+def verify_all_backups() -> int:
+    """Verify SHA-256 manifests for all saved per-unit radio backups."""
+    manifests = sorted(UNITS_DIR.glob("*/*/manifest.json")) if UNITS_DIR.is_dir() else []
+    print(f"\n{C_CYAN}=== Verifying Saved Radio Backups ==={C_RESET}")
+    if not manifests:
+        print(f"  {C_DIM}(none){C_RESET}")
+        return 0
+    rc = 0
+    for m in manifests:
+        bdir = m.parent
+        rel = bdir.relative_to(FLASHER_DIR)
+        res = subprocess.run([sys.executable, "-I", str(RADIO_BACKUP), "verify", str(bdir)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0:
+            print(f"  {C_GREEN}✓{C_RESET} {rel}")
+        else:
+            rc = 1
+            detail = (res.stderr or res.stdout).strip().splitlines()[-1] if (res.stderr or res.stdout).strip() else "failed"
+            print(f"  {C_RED}✗{C_RESET} {rel} ({detail})")
+    return rc
+
+
+def run_verify(wait_for_boot: bool = False) -> int:
+    """Verify the connected OpenWrt dongle (via SSH) and saved backup hashes."""
+    if detect_edl() and not _find_openwrt_host():
+        print(f"{C_YELLOW}[!] Dongle is in EDL mode (05c6:9008) — skipping live OpenWrt SSH check.{C_RESET}")
+        dongle_rc = 0
+    else:
+        dongle_rc = verify_openwrt_dongle(wait_for_boot=wait_for_boot, timeout_s=60)
+    backup_rc = verify_all_backups()
+    return 0 if dongle_rc == 0 and backup_rc == 0 else 1
+
+
 def run_script(script_name: str, extra_args: list[str] | None = None) -> int:
     """Execute one of the flasher shell scripts."""
     script = FLASHER_DIR / script_name
@@ -584,18 +693,20 @@ def interactive_menu() -> int:
         print(f"  {C_BOLD}Tools{C_RESET}")
         print("    8) Reboot dongle to EDL mode (9008)")
         print("    9) SSH console (root@192.168.8.1)")
+        print("    v) Verify OpenWrt & backups    (IMEI, modem, Wi-Fi, web UI + backup SHA-256)")
         print(f"    d) Debug output: {dbg}   (show edl's raw output)")
         print("    0) Exit")
         print()
 
         try:
-            choice = input("Select [0-9, c, d]: ").strip().lower()
+            choice = input("Select [0-9, c, v, d]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
 
         if choice == "1":
-            run_script("flash-firmware.sh", ["--debug"] if debug_mode() else None)
+            if run_script("flash-firmware.sh", ["--debug"] if debug_mode() else None) == 0:
+                verify_openwrt_dongle(wait_for_boot=True, timeout_s=120)
         elif choice == "c":
             run_convert()
         elif choice == "2":
@@ -614,6 +725,8 @@ def interactive_menu() -> int:
             reboot_to_edl()
         elif choice == "9":
             open_ssh()
+        elif choice == "v":
+            run_verify(wait_for_boot=True)
         elif choice == "d":
             os.environ["FLASH_DEBUG"] = "0" if debug_mode() else "1"
             continue
@@ -634,6 +747,8 @@ def parse_args() -> argparse.Namespace:
         description="All-in-One MSM8916 4G Dongle Flasher & Recovery Toolkit"
     )
     parser.add_argument("--flash", action="store_true", help="Run OpenWrt firmware flasher")
+    parser.add_argument("--no-verify", action="store_true", help="Skip post-flash OpenWrt verification with --flash")
+    parser.add_argument("--verify", action="store_true", help="Verify booted OpenWrt dongle (IMEI, modem, Wi-Fi) and saved backups")
     parser.add_argument("--convert", action="store_true",
                         help="Convert stock dongles to OpenWrt one after another (backup + flash + verify)")
     parser.add_argument("--debug", action="store_true", help="Show edl's raw output (any action)")
@@ -657,7 +772,12 @@ def main() -> int:
     if args.convert:
         return run_convert()
     if args.flash:
-        return run_script("flash-firmware.sh", ["--debug"] if args.debug else None)
+        rc = run_script("flash-firmware.sh", ["--debug"] if args.debug else None)
+        if rc == 0 and not args.no_verify:
+            return verify_openwrt_dongle(wait_for_boot=True, timeout_s=120)
+        return rc
+    if args.verify:
+        return run_verify(wait_for_boot=False)
     if args.backup_radio:
         return run_radio_backup(radio_only=False)
     if args.backup_radio_only:
