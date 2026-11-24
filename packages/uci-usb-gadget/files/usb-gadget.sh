@@ -190,6 +190,30 @@ setup_ncm() {
     echo "+NCM"
 }
 
+update_inittab_ttygs0() {
+    local want_shell="$1"
+    local line="ttyGS0::askfirst:/usr/libexec/login.sh"
+    local tmp
+    if [ "$want_shell" = "1" ]; then
+        if grep -qxF "$line" /etc/inittab 2>/dev/null && \
+           [ "$(grep -c 'ttyGS0' /etc/inittab 2>/dev/null || echo 0)" -eq 1 ]; then
+            return 0
+        fi
+        log "Enabling serial shell on ttyGS0"
+        tmp="/etc/inittab.tmp.$$"
+        grep -v 'ttyGS0' /etc/inittab 2>/dev/null > "$tmp" || true
+        echo "$line" >> "$tmp"
+    else
+        grep -q 'ttyGS0' /etc/inittab 2>/dev/null || return 0
+        log "ACM in raw TTY mode (removing shell from inittab)"
+        tmp="/etc/inittab.tmp.$$"
+        grep -v 'ttyGS0' /etc/inittab 2>/dev/null > "$tmp" || true
+    fi
+    mv -f "$tmp" /etc/inittab
+    sync
+    kill -HUP 1 2>/dev/null || true
+}
+
 setup_acm() {
     log "Enabling ACM"
     local func="${CFG_FUNCTIONS_PATH}/acm.GS0"
@@ -197,17 +221,7 @@ setup_acm() {
     mkdir -p "$func"
     ln -sf "$func" "${CFG_CONFIG_PATH}/"
     
-    # Manage shell in inittab
-    if [ "$CFG_ACM_SHELL" = "1" ]; then
-        log "Enabling serial shell on ttyGS0"
-        sed -i '/ttyGS0/d' /etc/inittab
-        echo "ttyGS0::askfirst:/usr/libexec/login.sh" >> /etc/inittab
-    else
-        log "ACM in raw TTY mode (removing shell from inittab)"
-        sed -i '/ttyGS0/d' /etc/inittab
-    fi
-    
-    kill -HUP 1 2>/dev/null || true
+    update_inittab_ttygs0 "$CFG_ACM_SHELL"
     
     echo "+ACM"
 }
@@ -246,6 +260,8 @@ bring_up_iface() {
     ip link set "$iface" up 2>/dev/null || ifconfig "$iface" up 2>/dev/null || true
 }
 
+BRIDGE_UCI_CHANGED=0
+
 add_to_bridge() {
     local ifname_file="$1"
     
@@ -265,9 +281,16 @@ add_to_bridge() {
     done
     [ -z "$dev_sec" ] && dev_sec="@device[0]"
 
-    # Add the interface to bridge
-    uci -q del_list "network.${dev_sec}.ports=$iface" 2>/dev/null || true
-    uci add_list "network.${dev_sec}.ports=$iface"
+    # Only mutate UCI / overlay when the port is not already in br-lan
+    local cur_ports=" $(uci -q get "network.${dev_sec}.ports" 2>/dev/null || true) "
+    case "$cur_ports" in
+        *" $iface "*) ;;
+        *)
+            uci -q del_list "network.${dev_sec}.ports=$iface" 2>/dev/null || true
+            uci add_list "network.${dev_sec}.ports=$iface"
+            BRIDGE_UCI_CHANGED=1
+            ;;
+    esac
 
     # Immediately attach to kernel bridge
     ip link set "$iface" master br-lan 2>/dev/null || brctl addif br-lan "$iface" 2>/dev/null || true
@@ -275,16 +298,20 @@ add_to_bridge() {
 
 setup_network() {
     sleep 1
+    BRIDGE_UCI_CHANGED=0
     
     [ "$CFG_RNDIS" = "1" ] && add_to_bridge "${CFG_FUNCTIONS_PATH}/rndis.usb0/ifname"
     [ "$CFG_ECM" = "1" ] && add_to_bridge "${CFG_FUNCTIONS_PATH}/ecm.usb0/ifname"
     [ "$CFG_NCM" = "1" ] && add_to_bridge "${CFG_FUNCTIONS_PATH}/ncm.usb0/ifname"
     
-    uci commit network
-    /etc/init.d/network reload
-    /etc/init.d/dnsmasq restart 2>/dev/null || true
-    /etc/init.d/odhcpd restart 2>/dev/null || true
-    /etc/init.d/firewall reload 2>/dev/null || true
+    if [ "$BRIDGE_UCI_CHANGED" = "1" ]; then
+        uci commit network
+        sync
+        /etc/init.d/network reload
+        /etc/init.d/dnsmasq restart 2>/dev/null || true
+        /etc/init.d/odhcpd restart 2>/dev/null || true
+        /etc/init.d/firewall reload 2>/dev/null || true
+    fi
 
     # Post-reload bringup check
     [ "$CFG_RNDIS" = "1" ] && bring_up_iface "${CFG_FUNCTIONS_PATH}/rndis.usb0/ifname"
@@ -422,17 +449,23 @@ teardown_gadget() {
     echo "" > UDC 2>/dev/null || true
     
     # Remove from network bridge
+    local removed=0
     for ifname in functions/*/ifname; do
         if [ -f "$ifname" ]; then
             local iface="$(cat "$ifname")"
             [ -n "$iface" ] || continue
             for dev_sec in $(uci -q show network | grep -E '\.name=.br-lan.' | cut -d. -f2) "@device[0]"; do
-                uci -q del_list "network.${dev_sec}.ports=$iface" 2>/dev/null || true
+                if uci -q del_list "network.${dev_sec}.ports=$iface" 2>/dev/null; then
+                    removed=1
+                fi
             done
         fi
     done
-    uci commit network
-    /etc/init.d/network reload
+    if [ "$removed" = "1" ] && [ -n "$(uci -q changes network 2>/dev/null)" ]; then
+        uci commit network
+        sync
+        /etc/init.d/network reload
+    fi
     
     # Remove configuration links
     rm -f configs/c.1/* 2>/dev/null || true
@@ -453,8 +486,7 @@ teardown_gadget() {
     rmdir "$CFG_GADGET_NAME" 2>/dev/null || true
     
     # Clean shell from inittab
-    sed -i '/ttyGS0/d' /etc/inittab
-    kill -HUP 1 2>/dev/null || true
+    update_inittab_ttygs0 0
     
     log "Teardown complete"
     log "USB port available for host mode"

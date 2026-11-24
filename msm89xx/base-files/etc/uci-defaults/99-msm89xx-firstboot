@@ -180,7 +180,9 @@ commit firewall
 EOF
 
 uci commit
+sync
 
 [ -x /etc/init.d/umount-overlay ] && /etc/init.d/umount-overlay enable
+sync
 
 exit 0

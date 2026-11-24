@@ -577,6 +577,7 @@ def verify_openwrt_dongle(wait_for_boot: bool = True, timeout_s: int = 120) -> i
     script = (
         convert.VERIFY_SCRIPT
         + '; echo RELEASE=$(. /etc/openwrt_release 2>/dev/null && printf "%s" "$DISTRIB_DESCRIPTION")'
+        + '; sync'
     )
     try:
         res = subprocess.run(

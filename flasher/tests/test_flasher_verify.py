@@ -31,10 +31,11 @@ class FlasherVerifyTest(unittest.TestCase):
         fake_res = subprocess.CompletedProcess(["ssh"], 0, stdout=ssh_out, stderr="")
         buf = io.StringIO()
         with mock.patch.object(flasher, "check_tcp", side_effect=lambda h, p: h == "192.168.8.1" and p in (22, 80)), \
-             mock.patch.object(flasher.subprocess, "run", return_value=fake_res), \
+             mock.patch.object(flasher.subprocess, "run", return_value=fake_res) as run_mock, \
              redirect_stdout(buf):
             rc = flasher.verify_openwrt_dongle(wait_for_boot=False)
         self.assertEqual(rc, 0)
+        self.assertIn("; sync", run_mock.call_args[0][0][-1])
         out = buf.getvalue()
         self.assertIn("860018046041589", out)
         self.assertIn("OpenWrt 24.10.0", out)
