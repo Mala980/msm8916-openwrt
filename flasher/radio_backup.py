@@ -357,10 +357,36 @@ def touch_unit(unit_dir, serial, identity):
 # commands
 
 
+def is_working_edl(path):
+    """Return True if `path` executes cleanly (catches broken/stale wrappers)."""
+    try:
+        res = subprocess.run([str(path), "--help"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, timeout=10)
+        return res.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def resolve_edl(explicit=None, root_dir=HERE):
+    """Locate a working edl binary: explicit/--edl, EDL_BIN, ./temp/edl, or PATH."""
+    if explicit:
+        return explicit if os.path.isfile(explicit) and os.access(explicit, os.X_OK) else None
+    env_edl = os.environ.get("EDL_BIN")
+    if env_edl:
+        return env_edl if os.path.isfile(env_edl) and os.access(env_edl, os.X_OK) else None
+    local_edl = os.path.join(str(root_dir), "temp", "edl", "venv", "bin", "edl")
+    if os.path.isfile(local_edl) and os.access(local_edl, os.X_OK) and is_working_edl(local_edl):
+        return local_edl
+    sys_edl = shutil.which("edl")
+    if sys_edl and is_working_edl(sys_edl):
+        return sys_edl
+    return None
+
+
 def cmd_backup(a):
-    edl = a.edl or os.environ.get("EDL_BIN") or shutil.which("edl")
+    edl = resolve_edl(a.edl)
     if not edl:
-        warn("edl not found — pass --edl or set EDL_BIN")
+        warn("edl not found — pass --edl, set EDL_BIN, or run flasher.py / flash-firmware.sh to install ./temp/edl")
         return EXIT_ERR
     if a.parts == "unique":
         parts = UNIQUE_PARTS

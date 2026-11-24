@@ -23,6 +23,9 @@ RADIO = ["fsc", "fsg", "modemst1", "modemst2", "modem", "persist", "sec"]
 
 FAKE_EDL = r'''#!/usr/bin/env python3
 import os, sys
+if "--help" in sys.argv or "-h" in sys.argv:
+    print("usage: edl")
+    sys.exit(0)
 d = os.environ["FAKE_DIR"]
 with open(os.path.join(d, "edl.log"), "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
@@ -135,6 +138,36 @@ class FlashNonInteractiveTest(unittest.TestCase):
         self.assertTrue([c for c in calls if c.startswith("r ")], "live backup still runs")
         self.assertTrue(any(c.startswith("w rootfs ") for c in calls))
         self.assertTrue(any(c.startswith("w modemst1 ") for c in calls))
+
+    def test_prefers_local_temp_edl_over_broken_path_edl(self):
+        # Replace PATH edl with a broken wrapper (like a stale ~/.local/bin/edl).
+        self._exe("edl", "#!/bin/sh\necho 'broken wrapper' >&2\nexit 126\n")
+        local_bin = os.path.join(self.dir, "temp", "edl", "venv", "bin")
+        os.makedirs(local_bin)
+        local_edl = os.path.join(local_bin, "edl")
+        with open(local_edl, "w") as f:
+            f.write(FAKE_EDL)
+        os.chmod(local_edl, 0o755)
+        self.env.pop("EDL_BIN", None)
+        r = self.run_flash("--firmware", self.fw, "--radio-from", self.radio,
+                           "--skip-live-backup", "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+        self.assertTrue(any(c.startswith("w rootfs ") for c in self.edl_calls()))
+
+    def test_ensure_python_skips_old_python3(self):
+        # Simulate macOS /usr/bin/python3 returning 3.9 while python3.11 is available.
+        real_py = sys.executable
+        old_py = (
+            "#!/bin/sh\n"
+            "case \"$*\" in *\"(3, 10)\"*) exit 1 ;; esac\n"
+            f"exec \"{real_py}\" \"$@\"\n"
+        )
+        self._exe("python3", old_py)
+        self._exe("python3.11", f"#!/bin/sh\nexec \"{real_py}\" \"$@\"\n")
+        r = self.run_flash("--firmware", self.fw, "--radio-from", self.radio,
+                           "--skip-live-backup", "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+        self.assertTrue(any(c.startswith("w rootfs ") for c in self.edl_calls()))
 
 
 if __name__ == "__main__":

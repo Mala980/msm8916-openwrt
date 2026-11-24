@@ -195,6 +195,35 @@ class RadioBackupTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("0x242efec7", r.stdout)
 
+    def test_resolve_edl_ignores_broken_path_and_prefers_local_temp(self):
+        sys.path.insert(0, os.path.dirname(TOOL))
+        import radio_backup
+        bin_dir = os.path.join(self.tmp.name, "pathbin")
+        os.makedirs(bin_dir)
+        broken = os.path.join(bin_dir, "edl")
+        with open(broken, "w") as f:
+            f.write("#!/bin/sh\nexit 126\n")
+        os.chmod(broken, 0o755)
+
+        root_dir = os.path.join(self.tmp.name, "flasher_root")
+        saved_path = os.environ.get("PATH", "")
+        saved_edl_bin = os.environ.pop("EDL_BIN", None)
+        try:
+            os.environ["PATH"] = bin_dir + os.pathsep + saved_path
+            self.assertIsNone(radio_backup.resolve_edl(root_dir=root_dir))
+
+            local_bin = os.path.join(root_dir, "temp", "edl", "venv", "bin")
+            os.makedirs(local_bin)
+            local_edl = os.path.join(local_bin, "edl")
+            with open(local_edl, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(local_edl, 0o755)
+            self.assertEqual(radio_backup.resolve_edl(root_dir=root_dir), local_edl)
+        finally:
+            os.environ["PATH"] = saved_path
+            if saved_edl_bin is not None:
+                os.environ["EDL_BIN"] = saved_edl_bin
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

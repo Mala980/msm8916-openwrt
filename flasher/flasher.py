@@ -18,6 +18,10 @@ import time
 from pathlib import Path
 
 FLASHER_DIR = Path(__file__).resolve().parent
+if str(FLASHER_DIR) not in sys.path:
+    sys.path.insert(0, str(FLASHER_DIR))
+
+import radio_backup  # noqa: E402
 
 C_RESET = "\033[0m"
 C_BOLD = "\033[1m"
@@ -59,15 +63,104 @@ def find_adb() -> str | None:
 
 
 def find_edl() -> str | None:
-    """Locate edl binary from EDL_BIN, PATH, or ./temp/edl/venv/bin/edl."""
+    """Locate a working edl binary from EDL_BIN, ./temp/edl/venv/bin/edl, or PATH."""
+    return radio_backup.resolve_edl(root_dir=str(FLASHER_DIR))
+
+
+def _is_python_310(py_path: str) -> bool:
+    """Return True if py_path is a Python >= 3.10 interpreter."""
+    try:
+        res = subprocess.run(
+            [py_path, "-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return res.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def find_python_310() -> str | None:
+    """Locate a Python >= 3.10 interpreter (required by edlclient)."""
+    candidates = [
+        str(FLASHER_DIR / "temp" / "python" / "bin" / "python3"),
+        sys.executable,
+        "python3",
+        "python3.13",
+        "python3.12",
+        "python3.11",
+        "python3.10",
+        "/opt/homebrew/bin/python3.13",
+        "/opt/homebrew/bin/python3.12",
+        "/opt/homebrew/bin/python3.11",
+        "/opt/homebrew/bin/python3.10",
+        "/usr/local/bin/python3.13",
+        "/usr/local/bin/python3.12",
+        "/usr/local/bin/python3.11",
+        "/usr/local/bin/python3.10",
+    ]
+    seen: set[str] = set()
+    for cand in candidates:
+        resolved = cand if os.path.isabs(cand) else shutil.which(cand)
+        if not resolved or resolved in seen or not os.access(resolved, os.X_OK):
+            continue
+        seen.add(resolved)
+        if _is_python_310(resolved):
+            return resolved
+    return None
+
+
+def install_local_edl() -> str | None:
+    """Install bkerler/edl into ./temp/edl when no working edl is available."""
     env_edl = os.environ.get("EDL_BIN")
-    if env_edl and Path(env_edl).is_file():
-        return env_edl
-    sys_edl = shutil.which("edl")
-    if sys_edl:
-        return sys_edl
-    local_edl = FLASHER_DIR / "temp" / "edl" / "venv" / "bin" / "edl"
-    return str(local_edl) if local_edl.is_file() else None
+    if env_edl:
+        print(f"{C_RED}[-] EDL_BIN is set to '{env_edl}' but is not an executable file.{C_RESET}")
+        return None
+    py = find_python_310()
+    if not py:
+        print(f"{C_RED}[-] Python >= 3.10 is required for edl. Install Python 3.10+ or run 'Flash OpenWrt' to download standalone Python.{C_RESET}")
+        return None
+
+    edl_dir = FLASHER_DIR / "temp" / "edl"
+    src_dir = FLASHER_DIR / "edl" / "src" if (FLASHER_DIR / "edl" / "src").is_dir() else edl_dir / "src"
+    wheels_dir = next(
+        (d for d in (FLASHER_DIR / "edl" / "wheels", edl_dir / "wheels") if d.is_dir()),
+        None,
+    )
+    venv_dir = edl_dir / "venv"
+    local_edl = venv_dir / "bin" / "edl"
+
+    print(f"{C_GREEN}[*] Installing edl into ./temp/edl (Python: {py})...{C_RESET}")
+    edl_dir.mkdir(parents=True, exist_ok=True)
+    if not src_dir.is_dir():
+        if not shutil.which("git"):
+            print(f"{C_RED}[-] git is required to install edl into ./temp/edl.{C_RESET}")
+            return None
+        if run_cmd(["git", "clone", "-q", "--depth", "1", "https://github.com/bkerler/edl", str(src_dir)]) != 0:
+            print(f"{C_RED}[-] edl clone failed.{C_RESET}")
+            return None
+        run_cmd(["git", "-C", str(src_dir), "submodule", "update", "-q", "--init", "--recursive"])
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir, ignore_errors=True)
+    if run_cmd([py, "-m", "venv", str(venv_dir)]) != 0:
+        print(f"{C_RED}[-] Failed to create Python venv in ./temp/edl/venv.{C_RESET}")
+        return None
+    pip = str(venv_dir / "bin" / "pip")
+    if wheels_dir is not None:
+        install_cmd = [pip, "install", "-q", "--no-index", "--find-links", str(wheels_dir), str(src_dir)]
+    else:
+        run_cmd([pip, "install", "-q", "--upgrade", "pip"])
+        install_cmd = [pip, "install", "-q", str(src_dir)]
+    if run_cmd(install_cmd) != 0 or not local_edl.is_file():
+        print(f"{C_RED}[-] edl install failed.{C_RESET}")
+        return None
+    return str(local_edl)
+
+
+def ensure_edl() -> str | None:
+    """Return a working edl path, installing into ./temp/edl if needed."""
+    return find_edl() or install_local_edl()
 
 
 def detect_edl() -> bool:
@@ -221,9 +314,8 @@ def edl_step(edl: str, label: str, *args: str) -> int:
 
 def ensure_edl_session() -> str | None:
     """edl binary + dongle in EDL mode, or None (with the reason printed)."""
-    edl = find_edl()
+    edl = ensure_edl()
     if not edl:
-        print(f"{C_RED}[-] edl not found. Run 'Flash OpenWrt' once to install it into ./temp/edl.{C_RESET}")
         return None
     if not detect_edl():
         if not wait_for_dongle():
@@ -386,12 +478,11 @@ def run_convert() -> int:
     """Convert stock dongles to OpenWrt one after another (see convert.py)."""
     import convert
 
-    adb, edl = find_adb(), find_edl()
+    adb, edl = find_adb(), ensure_edl()
     if not adb:
         print(f"{C_RED}[-] adb not found (needed to read stock dongles). Install it or run 'Flash OpenWrt' once.{C_RESET}")
         return 1
     if not edl:
-        print(f"{C_RED}[-] edl not found. Run 'Flash OpenWrt' once to install it into ./temp/edl.{C_RESET}")
         return 1
     print(f"{C_CYAN}=== Convert stock dongles → OpenWrt ==={C_RESET}")
     print("  Per dongle: back up its unique partitions (IMEI, calibration, MACs), flash OpenWrt,")

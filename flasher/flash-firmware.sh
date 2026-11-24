@@ -90,19 +90,38 @@ edl_step() {
     return "$rc"
 }
 
-# python3: system one, else a standalone build downloaded into ./temp/python
+python_ok() {
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+}
+
+# python3 (>= 3.10 for edlclient): ./temp/python, system/Homebrew, else download standalone Python
 ensure_python() {
-    command -v python3 >/dev/null 2>&1 && { PY=python3; return; }
-    [[ -x "$TEMP_DIR/python/bin/python3" ]] && { PY="$TEMP_DIR/python/bin/python3"; return; }
+    if [[ -x "$TEMP_DIR/python/bin/python3" ]] && python_ok "$TEMP_DIR/python/bin/python3"; then
+        PY="$TEMP_DIR/python/bin/python3"; return
+    fi
+    local cand p
+    for cand in python3 python3.13 python3.12 python3.11 python3.10 \
+                /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
+                /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3.10; do
+        if [[ "$cand" == /* ]]; then
+            [[ -x "$cand" ]] && p="$cand" || continue
+        else
+            p="$(command -v "$cand" 2>/dev/null || true)"
+            [[ -n "$p" ]] || continue
+        fi
+        if python_ok "$p"; then
+            PY="$p"; return
+        fi
+    done
     local t=20241016 v=3.12.7 triple
     case "$(uname -s)-$(uname -m)" in
         Darwin-arm64)  triple=aarch64-apple-darwin ;;
         Darwin-x86_64) triple=x86_64-apple-darwin ;;
         Linux-x86_64)  triple=x86_64-unknown-linux-gnu ;;
         Linux-aarch64) triple=aarch64-unknown-linux-gnu ;;
-        *) die "no python3 and no standalone build for this platform — install python3" ;;
+        *) die "no Python >= 3.10 and no standalone build for this platform — install Python 3.10+" ;;
     esac
-    log "python3 not found — downloading a standalone Python into ./temp/python"
+    log "Python >= 3.10 not found — downloading a standalone Python into ./temp/python"
     mkdir -p "$TEMP_DIR/python"
     curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/$t/cpython-$v+$t-$triple-install_only.tar.gz" \
         | tar -xz -C "$TEMP_DIR/python" --strip-components=1 || die "python download failed"
@@ -121,21 +140,51 @@ ensure_adb() {
     ADB="$TEMP_DIR/platform-tools/adb"
 }
 
-# edl: EDL_BIN or a system edl, else install it into ./temp/edl
+# edl: EDL_BIN, else ./temp/edl (workspace), else a working system edl on PATH, else install into ./temp/edl
 ensure_edl() {
-    [[ -n "$EDL" && -x "$EDL" ]] && return
-    command -v edl >/dev/null 2>&1 && { EDL=edl; return; }
-    [[ -x "$TEMP_DIR/edl/venv/bin/edl" ]] && { EDL="$TEMP_DIR/edl/venv/bin/edl"; return; }
+    if [[ -n "$EDL" ]]; then
+        [[ -x "$EDL" ]] && return
+        die "EDL_BIN is set to '$EDL' but is not executable"
+    fi
+    if [[ -x "$TEMP_DIR/edl/venv/bin/edl" ]]; then
+        if "$TEMP_DIR/edl/venv/bin/edl" --help >/dev/null 2>&1; then
+            EDL="$TEMP_DIR/edl/venv/bin/edl"
+            return
+        fi
+        warn "Local ./temp/edl/venv/bin/edl is broken — rebuilding ./temp/edl"
+        rm -rf "$TEMP_DIR/edl/venv"
+    fi
+    local sys_edl
+    sys_edl="$(command -v edl 2>/dev/null || true)"
+    if [[ -n "$sys_edl" ]]; then
+        if "$sys_edl" --help >/dev/null 2>&1; then
+            EDL="$sys_edl"
+            return
+        fi
+        warn "Ignoring broken edl on PATH ($sys_edl) — installing local copy into ./temp/edl"
+    fi
     ensure_python
-    command -v git >/dev/null || die "git required to fetch edl"
+    local src_dir="$TEMP_DIR/edl/src"
+    [[ -d "$PWD/edl/src" ]] && src_dir="$PWD/edl/src"
+    local wheels_dir=""
+    if [[ -d "$PWD/edl/wheels" ]]; then
+        wheels_dir="$PWD/edl/wheels"
+    elif [[ -d "$TEMP_DIR/edl/wheels" ]]; then
+        wheels_dir="$TEMP_DIR/edl/wheels"
+    fi
     log "edl not found — installing it once into ./temp/edl"
-    if [[ ! -d "$TEMP_DIR/edl/src" ]]; then
-        git clone -q --depth 1 https://github.com/bkerler/edl "$TEMP_DIR/edl/src" || die "edl clone failed"
-        git -C "$TEMP_DIR/edl/src" submodule update -q --init --recursive || true
+    if [[ ! -d "$src_dir" ]]; then
+        command -v git >/dev/null || die "git required to fetch edl"
+        git clone -q --depth 1 https://github.com/bkerler/edl "$src_dir" || die "edl clone failed"
+        git -C "$src_dir" submodule update -q --init --recursive || true
     fi
     "$PY" -m venv "$TEMP_DIR/edl/venv"
-    "$TEMP_DIR/edl/venv/bin/pip" install -q --upgrade pip
-    "$TEMP_DIR/edl/venv/bin/pip" install -q "$TEMP_DIR/edl/src"
+    if [[ -n "$wheels_dir" ]]; then
+        "$TEMP_DIR/edl/venv/bin/pip" install -q --no-index --find-links "$wheels_dir" "$src_dir" || die "offline edl install failed"
+    else
+        "$TEMP_DIR/edl/venv/bin/pip" install -q --upgrade pip
+        "$TEMP_DIR/edl/venv/bin/pip" install -q "$src_dir" || die "edl install failed"
+    fi
     [[ -x "$TEMP_DIR/edl/venv/bin/edl" ]] || die "edl install failed"
     EDL="$TEMP_DIR/edl/venv/bin/edl"
 }
