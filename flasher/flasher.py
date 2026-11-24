@@ -8,6 +8,7 @@ per-unit radio backup/verify, and EDL/SSH utilities.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
 import shutil
@@ -625,14 +626,8 @@ def configure_wifi_menu(enabled: bool | None = None) -> int:
     return rc
 
 
-def verify_openwrt_dongle(
-    wait_for_boot: bool = True,
-    timeout_s: int = 120,
-    disable_wifi: bool | None = None,
-) -> int:
-    """Wait for OpenWrt SSH and verify modem, IMEI, Wi-Fi, and web UI."""
-    import convert
-
+def _wait_openwrt_host(wait_for_boot: bool = True, timeout_s: int = 120) -> str | None:
+    """Return an online OpenWrt host, optionally waiting up to timeout_s."""
     host = _find_openwrt_host()
     if not host and wait_for_boot:
         print(f"{C_GREEN}[*] Waiting for OpenWrt to boot on 192.168.8.1 (up to {timeout_s}s, Ctrl-C to skip)...{C_RESET}")
@@ -644,10 +639,226 @@ def verify_openwrt_dongle(
                     break
                 time.sleep(2)
         except KeyboardInterrupt:
-            print(f"\n{C_YELLOW}[!] Verification skipped by user.{C_RESET}")
-            return 0
+            print(f"\n{C_YELLOW}[!] Skipped by user.{C_RESET}")
+            return None
     if not host:
         print(f"{C_RED}[-] OpenWrt SSH not reachable on 192.168.8.1 or 192.168.1.1.{C_RESET}")
+        return None
+    return host
+
+
+def _upload_file_ssh(convert_mod, host: str, local_path: Path, remote_path: str, mode: str) -> bool:
+    """Atomically write a local file onto the dongle over SSH without requiring sftp."""
+    data = local_path.read_text()
+    tmp_path = f"{remote_path}.new"
+    res = subprocess.run(
+        ["ssh"] + _ssh_opts(convert_mod) + [
+            f"root@{host}",
+            f"cat > {tmp_path} && chmod {mode} {tmp_path} && mv -f {tmp_path} {remote_path}",
+        ],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    return res.returncode == 0
+
+
+def _file_hashes(path: Path) -> tuple[str, str]:
+    """Return (sha256, md5) hex digests for a local file."""
+    raw = path.read_bytes()
+    return hashlib.sha256(raw).hexdigest(), hashlib.md5(raw).hexdigest()
+
+
+def _format_change(current: str, target: str, changed: bool) -> str:
+    """Format a current -> target status line showing CHANGED vs unchanged."""
+    if changed:
+        return f"current={C_YELLOW}{current}{C_RESET} -> {C_GREEN}{target}{C_RESET} ({C_YELLOW}CHANGED{C_RESET})"
+    return f"current={C_GREEN}{current}{C_RESET} ({C_DIM}unchanged{C_RESET})"
+
+
+def apply_dongle_bugfixes(
+    host: str,
+    disable_wifi: bool = True,
+    reboot_after: bool = True,
+) -> int:
+    """Inspect current dongle state, apply overlay/gadget/permission/Wi-Fi fixes, and reboot if changed."""
+    import convert
+
+    repo_root = FLASHER_DIR.parent
+    usb_gadget_src = repo_root / "packages" / "uci-usb-gadget" / "files" / "usb-gadget.sh"
+    wifi_led_src = repo_root / "msm89xx" / "base-files" / "etc" / "hotplug.d" / "ieee80211" / "99-wifi-led"
+
+    print(f"\n{C_CYAN}=== Inspecting & Applying OpenWrt Bug Fixes ({host}) ==={C_RESET}")
+    # Wait for first-boot firmware dumper so /etc/config/wireless isn't overwritten later,
+    # then inspect current state before modifying anything.
+    prep_cmd = (
+        "if [ -x /etc/init.d/msm-firmware-dumper ]; then "
+        "for i in $(seq 1 45); do [ -f /lib/firmware/DUMPED ] && break; sleep 1; done; "
+        "fi; "
+        "for i in $(seq 1 20); do uci -q get wireless.radio0 >/dev/null 2>&1 && break; sleep 2; done; "
+        "USB_STATE=$([ -f /usr/sbin/usb-gadget ] && (grep -q update_inittab_ttygs0 /usr/sbin/usb-gadget && echo hardened || echo legacy) || echo missing); "
+        "USB_HASH=$( (sha256sum /usr/sbin/usb-gadget 2>/dev/null || md5sum /usr/sbin/usb-gadget 2>/dev/null) | awk '{print $1}'); "
+        "WLED_STATE=$([ -f /etc/hotplug.d/ieee80211/99-wifi-led ] && (grep -q 'disabled=.*0' /etc/hotplug.d/ieee80211/99-wifi-led && echo forces-on || echo fixed) || echo missing); "
+        "WLED_HASH=$( (sha256sum /etc/hotplug.d/ieee80211/99-wifi-led 2>/dev/null || md5sum /etc/hotplug.d/ieee80211/99-wifi-led 2>/dev/null) | awk '{print $1}'); "
+        "PERM_BAD=0; "
+        "for f in /etc/init.d/led /etc/init.d/modem-bandlock /etc/init.d/xl2tpd /etc/init.d/umount-overlay /lib/netifd/proto/l2tp.sh /lib/netifd/proto/sstp.sh /usr/sbin/xl2tpd /usr/sbin/xl2tpd-control /usr/bin/modem-speedtest; do "
+        "[ -e \"$f\" ] && [ ! -x \"$f\" ] && PERM_BAD=$((PERM_BAD + 1)); "
+        "done; "
+        "UMOUNT_EN=$([ -x /etc/init.d/umount-overlay ] && (/etc/init.d/umount-overlay enabled 2>/dev/null && echo 1 || echo 0) || echo na); "
+        "WIFI_DIS=$(uci -q get wireless.radio0.disabled 2>/dev/null || echo 0); "
+        "WIFI_DEF_DIS=$(uci -q get wireless.default_radio0.disabled 2>/dev/null || echo ''); "
+        "echo \"USB_STATE=$USB_STATE\"; echo \"USB_HASH=$USB_HASH\"; "
+        "echo \"WLED_STATE=$WLED_STATE\"; echo \"WLED_HASH=$WLED_HASH\"; "
+        "echo \"PERM_BAD=$PERM_BAD\"; echo \"UMOUNT_EN=$UMOUNT_EN\"; "
+        "echo \"WIFI_DIS=$WIFI_DIS\"; echo \"WIFI_DEF_DIS=$WIFI_DEF_DIS\""
+    )
+    try:
+        inspect_res = subprocess.run(
+            ["ssh"] + _ssh_opts(convert) + [f"root@{host}", prep_cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90,
+        )
+        if inspect_res.returncode != 0 and not inspect_res.stdout.strip():
+            err = inspect_res.stderr.strip() or f"ssh exited {inspect_res.returncode}"
+            print(f"{C_RED}[-] Failed to inspect dongle: {err}{C_RESET}")
+            return 1
+        kv = dict(line.split("=", 1) for line in inspect_res.stdout.splitlines() if "=" in line)
+        any_changed = False
+
+        if usb_gadget_src.is_file():
+            usb_cur_state = kv.get("USB_STATE", "").strip() or "unknown"
+            usb_cur_hash = kv.get("USB_HASH", "").strip()
+            usb_same = bool(usb_cur_hash) and usb_cur_hash in _file_hashes(usb_gadget_src)
+            if usb_same:
+                print(f"  /usr/sbin/usb-gadget : {_format_change('hardened', 'hardened', False)}")
+            else:
+                if not _upload_file_ssh(convert, host, usb_gadget_src, "/usr/sbin/usb-gadget", "0755"):
+                    print(f"{C_RED}[-] Failed to update /usr/sbin/usb-gadget.{C_RESET}")
+                    return 1
+                cur_label = "outdated-hardened" if usb_cur_state == "hardened" else usb_cur_state
+                print(f"  /usr/sbin/usb-gadget : {_format_change(cur_label, 'hardened', True)}")
+                any_changed = True
+
+        if wifi_led_src.is_file():
+            wled_cur_state = kv.get("WLED_STATE", "").strip() or "unknown"
+            wled_cur_hash = kv.get("WLED_HASH", "").strip()
+            wled_same = bool(wled_cur_hash) and wled_cur_hash in _file_hashes(wifi_led_src)
+            if wled_same:
+                print(f"  99-wifi-led          : {_format_change('fixed', 'fixed', False)}")
+            else:
+                if not _upload_file_ssh(convert, host, wifi_led_src, "/etc/hotplug.d/ieee80211/99-wifi-led", "0644"):
+                    print(f"{C_RED}[-] Failed to update 99-wifi-led.{C_RESET}")
+                    return 1
+                cur_label = "outdated" if wled_cur_state == "fixed" else wled_cur_state
+                print(f"  99-wifi-led          : {_format_change(cur_label, 'fixed', True)}")
+                any_changed = True
+
+        perm_bad = kv.get("PERM_BAD", "").strip()
+        umount_en = kv.get("UMOUNT_EN", "").strip()
+        if not perm_bad and not umount_en:
+            perms_need_fix = True
+            perm_cur_label = "unknown"
+        else:
+            bad_count = int(perm_bad) if perm_bad.isdigit() else 0
+            perms_need_fix = bad_count > 0 or umount_en == "0"
+            parts = []
+            if bad_count > 0:
+                parts.append(f"{bad_count} non-exec")
+            if umount_en == "0":
+                parts.append("umount-overlay=disabled")
+            perm_cur_label = ", ".join(parts) if parts else "0755 + umount-overlay enabled"
+
+        disabled_val = "1" if disable_wifi else "0"
+        wifi_dis = kv.get("WIFI_DIS", "").strip()
+        wifi_def_dis = kv.get("WIFI_DEF_DIS", "").strip()
+        wifi_known = "WIFI_DIS" in kv
+        wifi_cur_label = (
+            "unknown"
+            if not wifi_known
+            else ("disabled (power-saving)" if wifi_dis == "1" else "enabled (AP mode)")
+        )
+        wifi_target_label = "disabled (power-saving)" if disable_wifi else "enabled (AP mode)"
+        wifi_needs_change = (not wifi_known) or (wifi_dis != disabled_val) or (
+            bool(wifi_def_dis) and wifi_def_dis != disabled_val
+        )
+
+        if perms_need_fix or wifi_needs_change:
+            fix_cmd = ""
+            if perms_need_fix:
+                fix_cmd += (
+                    "chmod 0755 /etc/init.d/led /etc/init.d/modem-bandlock /etc/init.d/xl2tpd "
+                    "/etc/init.d/umount-overlay /lib/netifd/proto/l2tp.sh /lib/netifd/proto/sstp.sh "
+                    "/usr/sbin/xl2tpd /usr/sbin/xl2tpd-control /usr/bin/modem-speedtest 2>/dev/null || true; "
+                    "[ -x /etc/init.d/umount-overlay ] && /etc/init.d/umount-overlay enable 2>/dev/null || true; "
+                )
+            if wifi_needs_change:
+                fix_cmd += (
+                    (
+                        "if grep -q 'disabled=.*0' /etc/hotplug.d/ieee80211/99-wifi-led 2>/dev/null; then "
+                        "printf '#!/bin/sh\\nexit 0\\n' > /etc/hotplug.d/ieee80211/99-wifi-led; fi; "
+                        if disable_wifi else ""
+                    )
+                    + f"uci set wireless.radio0.disabled='{disabled_val}'; "
+                    + f"uci set wireless.default_radio0.disabled='{disabled_val}' 2>/dev/null || true; "
+                    + "uci commit wireless; "
+                )
+            fix_cmd += "sync"
+            res = subprocess.run(
+                ["ssh"] + _ssh_opts(convert) + [f"root@{host}", fix_cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+            )
+            if res.returncode != 0:
+                err = res.stderr.strip() or f"ssh exited {res.returncode}"
+                print(f"{C_RED}[-] Failed to apply fixes: {err}{C_RESET}")
+                return 1
+
+        print(f"  Permissions & sync   : {_format_change(perm_cur_label, '0755 + umount-overlay enabled', perms_need_fix)}")
+        print(f"  Wi-Fi config         : {_format_change(wifi_cur_label, wifi_target_label, wifi_needs_change)}")
+        any_changed = any_changed or perms_need_fix or wifi_needs_change
+
+        if reboot_after:
+            if any_changed:
+                print(f"{C_GREEN}[*]{C_RESET} Changes applied — rebooting {host} to verify they survive reboot...")
+                subprocess.run(
+                    ["ssh"] + _ssh_opts(convert) + [f"root@{host}", "sync && reboot >/dev/null 2>&1 &"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+                )
+                time.sleep(5)
+            else:
+                print(f"{C_GREEN}[*]{C_RESET} All checks already matched target — skipping reboot.")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"{C_RED}[-] Fix operation failed: {exc}{C_RESET}")
+        return 1
+    return 0
+
+
+def fix_and_verify_dongle(
+    wait_for_boot: bool = True,
+    timeout_s: int = 120,
+    disable_wifi: bool | None = None,
+) -> int:
+    """Apply bug fixes + Wi-Fi choice to an OpenWrt dongle, reboot, and verify."""
+    if disable_wifi is None:
+        disable_wifi = ask_disable_wifi()
+    host = _wait_openwrt_host(wait_for_boot=wait_for_boot, timeout_s=timeout_s)
+    if not host:
+        return 1
+    if apply_dongle_bugfixes(host, disable_wifi=disable_wifi, reboot_after=True) != 0:
+        return 1
+    return verify_openwrt_dongle(wait_for_boot=True, timeout_s=timeout_s)
+
+
+def verify_openwrt_dongle(
+    wait_for_boot: bool = True,
+    timeout_s: int = 120,
+    disable_wifi: bool | None = None,
+) -> int:
+    """Wait for OpenWrt SSH and verify modem, IMEI, Wi-Fi, and web UI."""
+    import convert
+
+    host = _wait_openwrt_host(wait_for_boot=wait_for_boot, timeout_s=timeout_s)
+    if not host:
         return 1
 
     if disable_wifi is True:
@@ -667,6 +878,7 @@ def verify_openwrt_dongle(
         "echo IMEI=$(qmicli -p -d /dev/wwan0qmi0 --dms-get-ids 2>/dev/null | sed -n \"s/.*IMEI: '\\([0-9]*\\)'.*/\\1/p\"); "
         "echo WIFI=$([ \"$(wifi status 2>/dev/null | jsonfilter -e @.radio0.up)\" = true ] && echo 1 || echo 0); "
         "echo WIFI_DISABLED=$WIFI_DIS; "
+        "echo USB_GADGET=$(grep -q update_inittab_ttygs0 /usr/sbin/usb-gadget 2>/dev/null && echo hardened || echo legacy); "
         "echo MODEM=$(mmcli -L 2>/dev/null | grep -o '/org/freedesktop/ModemManager1/Modem/[0-9]*' | head -n 1); "
         "echo RELEASE=$(. /etc/openwrt_release 2>/dev/null && printf \"%s\" \"$DISTRIB_DESCRIPTION\"); "
         "sync"
@@ -695,6 +907,7 @@ def verify_openwrt_dongle(
     kv = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
     release = kv.get("RELEASE", "").strip()
     modem_path = kv.get("MODEM", "").strip()
+    usb_gadget_state = kv.get("USB_GADGET", "").strip()
     wifi_disabled = kv.get("WIFI_DISABLED", "0").strip() == "1"
     web_up = check_tcp(host, 80)
 
@@ -702,6 +915,9 @@ def verify_openwrt_dongle(
         print(f"  Release : {release}")
     print(f"  SSH     : root@{host} {C_GREEN}✓{C_RESET}")
     print(f"  Web UI  : http://{host} " + (f"{C_GREEN}✓{C_RESET}" if web_up else f"{C_YELLOW}! port 80 not listening{C_RESET}"))
+    if usb_gadget_state:
+        tag = f"{C_GREEN}✓{C_RESET}" if usb_gadget_state == "hardened" else f"{C_YELLOW}! legacy{C_RESET}"
+        print(f"  Gadget  : {usb_gadget_state} {tag}")
     print("  Modem   : " + (f"{modem_path} {C_GREEN}✓{C_RESET}" if parsed["modem_present"] else f"{C_RED}✗ missing{C_RESET}"))
     print("  IMEI    : " + (f"{parsed['imei']} {C_GREEN}✓{C_RESET}" if parsed["imei"] else f"{C_RED}✗ empty / unreadable{C_RESET}"))
     if wifi_disabled:
@@ -792,6 +1008,7 @@ def interactive_menu() -> int:
         print(f"  {C_BOLD}Tools{C_RESET}")
         print("    8) Reboot dongle to EDL mode (9008)")
         print("    9) SSH console (root@192.168.8.1)")
+        print("    f) Fix & verify OpenWrt        (apply bug fixes + Wi-Fi choice + reboot + verify)")
         print("    v) Verify OpenWrt & backups    (IMEI, modem, Wi-Fi, web UI + backup SHA-256)")
         print("    w) Disable / enable Wi-Fi      (save power & heat on connected dongle)")
         print(f"    d) Debug output: {dbg}   (show edl's raw output)")
@@ -799,7 +1016,7 @@ def interactive_menu() -> int:
         print()
 
         try:
-            choice = input("Select [0-9, c, v, w, d]: ").strip().lower()
+            choice = input("Select [0-9, c, f, v, w, d]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -807,7 +1024,7 @@ def interactive_menu() -> int:
         if choice == "1":
             disable_wifi = ask_disable_wifi()
             if run_script("flash-firmware.sh", ["--debug"] if debug_mode() else None) == 0:
-                verify_openwrt_dongle(wait_for_boot=True, timeout_s=120, disable_wifi=disable_wifi)
+                fix_and_verify_dongle(wait_for_boot=True, timeout_s=120, disable_wifi=disable_wifi)
         elif choice == "c":
             run_convert()
         elif choice == "2":
@@ -826,6 +1043,8 @@ def interactive_menu() -> int:
             reboot_to_edl()
         elif choice == "9":
             open_ssh()
+        elif choice == "f":
+            fix_and_verify_dongle(wait_for_boot=True, timeout_s=90)
         elif choice == "v":
             run_verify(wait_for_boot=True)
         elif choice == "w":
@@ -850,7 +1069,9 @@ def parse_args() -> argparse.Namespace:
         description="All-in-One MSM8916 4G Dongle Flasher & Recovery Toolkit"
     )
     parser.add_argument("--flash", action="store_true", help="Run OpenWrt firmware flasher")
-    parser.add_argument("--keep-wifi", action="store_true", help="Keep Wi-Fi enabled after --flash (default disables Wi-Fi)")
+    parser.add_argument("--fix", action="store_true",
+                        help="Apply bug fixes (usb-gadget, 99-wifi-led, permissions) + Wi-Fi choice + reboot + verify")
+    parser.add_argument("--keep-wifi", action="store_true", help="Keep Wi-Fi enabled after --flash or --fix (default disables Wi-Fi)")
     parser.add_argument("--wifi", choices=("off", "on"), help="Disable or enable Wi-Fi on connected OpenWrt dongle")
     parser.add_argument("--no-verify", action="store_true", help="Skip post-flash OpenWrt verification with --flash")
     parser.add_argument("--verify", action="store_true", help="Verify booted OpenWrt dongle (IMEI, modem, Wi-Fi) and saved backups")
@@ -879,8 +1100,23 @@ def main() -> int:
     if args.flash:
         rc = run_script("flash-firmware.sh", ["--debug"] if args.debug else None)
         if rc == 0 and not args.no_verify:
-            return verify_openwrt_dongle(wait_for_boot=True, timeout_s=120, disable_wifi=not args.keep_wifi)
+            disable_wifi = (args.wifi == "off") if args.wifi is not None else (not args.keep_wifi)
+            return fix_and_verify_dongle(wait_for_boot=True, timeout_s=120, disable_wifi=disable_wifi)
         return rc
+    if args.fix:
+        if args.wifi is not None:
+            disable_wifi = (args.wifi == "off")
+        elif args.keep_wifi:
+            disable_wifi = False
+        elif sys.stdin.isatty():
+            disable_wifi = None
+        else:
+            disable_wifi = True
+        return fix_and_verify_dongle(
+            wait_for_boot=True,
+            timeout_s=90,
+            disable_wifi=disable_wifi,
+        )
     if args.wifi:
         return configure_wifi_menu(enabled=(args.wifi == "on"))
     if args.verify:

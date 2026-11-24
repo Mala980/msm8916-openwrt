@@ -66,6 +66,73 @@ class FlasherVerifyTest(unittest.TestCase):
         with mock.patch("builtins.input", return_value="2"):
             self.assertFalse(flasher.ask_disable_wifi())
 
+    def test_fix_and_verify_dongle_applies_fixes_and_verifies_after_reboot(self):
+        calls = []
+        inspect_out = (
+            "USB_STATE=legacy\nUSB_HASH=deadbeef\n"
+            "WLED_STATE=forces-on\nWLED_HASH=deadbeef\n"
+            "PERM_BAD=2\nUMOUNT_EN=0\n"
+            "WIFI_DIS=0\nWIFI_DEF_DIS=0\n"
+        )
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd[-1])
+            out = inspect_out if "USB_STATE=" in cmd[-1] else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        buf = io.StringIO()
+        with mock.patch.object(flasher, "_wait_openwrt_host", return_value="192.168.8.1"), \
+             mock.patch.object(flasher.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(flasher.time, "sleep"), \
+             mock.patch.object(flasher, "verify_openwrt_dongle", return_value=0) as verify_mock, \
+             redirect_stdout(buf):
+            rc = flasher.fix_and_verify_dongle(wait_for_boot=False, disable_wifi=True)
+
+        self.assertEqual(rc, 0)
+        verify_mock.assert_called_once_with(wait_for_boot=True, timeout_s=120)
+        joined = "\n".join(calls)
+        self.assertIn("/usr/sbin/usb-gadget", joined)
+        self.assertIn("/etc/hotplug.d/ieee80211/99-wifi-led", joined)
+        self.assertIn("wireless.radio0.disabled='1'", joined)
+        self.assertIn("sync && reboot", joined)
+        out = buf.getvalue()
+        self.assertIn("legacy", out)
+        self.assertIn("forces-on", out)
+        self.assertIn("2 non-exec, umount-overlay=disabled", out)
+        self.assertIn("CHANGED", out)
+
+    def test_fix_and_verify_dongle_skips_unchanged_and_reboot(self):
+        repo_root = FLASHER_DIR.parent
+        usb_sha, _ = flasher._file_hashes(repo_root / "packages" / "uci-usb-gadget" / "files" / "usb-gadget.sh")
+        wled_sha, _ = flasher._file_hashes(repo_root / "msm89xx" / "base-files" / "etc" / "hotplug.d" / "ieee80211" / "99-wifi-led")
+        inspect_out = (
+            f"USB_STATE=hardened\nUSB_HASH={usb_sha}\n"
+            f"WLED_STATE=fixed\nWLED_HASH={wled_sha}\n"
+            "PERM_BAD=0\nUMOUNT_EN=1\n"
+            "WIFI_DIS=1\nWIFI_DEF_DIS=1\n"
+        )
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd[-1])
+            return subprocess.CompletedProcess(cmd, 0, stdout=inspect_out, stderr="")
+
+        buf = io.StringIO()
+        with mock.patch.object(flasher, "_wait_openwrt_host", return_value="192.168.8.1"), \
+             mock.patch.object(flasher.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(flasher.time, "sleep"), \
+             mock.patch.object(flasher, "verify_openwrt_dongle", return_value=0) as verify_mock, \
+             redirect_stdout(buf):
+            rc = flasher.fix_and_verify_dongle(wait_for_boot=False, disable_wifi=True)
+
+        self.assertEqual(rc, 0)
+        verify_mock.assert_called_once_with(wait_for_boot=True, timeout_s=120)
+        self.assertEqual(len(calls), 1)
+        out = buf.getvalue()
+        self.assertIn("unchanged", out)
+        self.assertNotIn("CHANGED", out)
+        self.assertIn("skipping reboot", out)
+
     def test_verify_openwrt_dongle_fails_when_imei_missing(self):
         ssh_out = "IMEI=\nWIFI=1\nMODEM=/org/freedesktop/ModemManager1/Modem/0\n"
         fake_res = subprocess.CompletedProcess(["ssh"], 0, stdout=ssh_out, stderr="")
