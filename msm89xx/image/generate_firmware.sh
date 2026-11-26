@@ -6,7 +6,19 @@
 
 set -euo pipefail
 
-OUT_FILE="${1:-uz801v3-firmware.zip}"
+OUT_FILE="${1:-firmware.zip}"
+
+# Per-device lk2nd configuration, passed by the image Makefile. An empty
+# LK2ND_COMPATIBLE lets lk2nd match dynamically from the boot cmdline instead
+# of forcing one board's device node; the bundle DTB only needs to carry the
+# candidate nodes.
+LK2ND_BUNDLE_DTB="${LK2ND_BUNDLE_DTB:-msm8916-512mb-mtp.dtb}"
+LK2ND_COMPATIBLE="${LK2ND_COMPATIBLE:-}"
+
+# Keep one build directory per lk2nd configuration: the generic boards share
+# a binary, UZ801 (and any future explicit compatible) gets its own.
+LK2ND_KEY="$(printf '%s' "${LK2ND_COMPATIBLE:-generic}-${LK2ND_BUNDLE_DTB%.dtb}" |
+    tr -c 'A-Za-z0-9_.-' '_')"
 
 ###############################################################################
 # Temporary working directory
@@ -21,7 +33,7 @@ fi
 
 trap 'if [ -n "$CLEANUP_DIR" ]; then rm -rf "$CLEANUP_DIR"; fi' EXIT
 
-BUILDDIR="$TMPDIR/msm8916-firmware-build"
+BUILDDIR="$TMPDIR/msm8916-firmware-build-$LK2ND_KEY"
 mkdir -p "$BUILDDIR"
 
 ###############################################################################
@@ -188,6 +200,7 @@ fi
 ###############################################################################
 
 echo "[+] Compiling lk2nd..."
+echo "[+] lk2nd config: bundle=$LK2ND_BUNDLE_DTB compatible=${LK2ND_COMPATIBLE:-<dynamic>}"
 
 if [ ! -f "$BUILDDIR/lk2nd/build-lk1st-msm8916/emmc_appsboot.mbn" ]; then
 
@@ -201,11 +214,18 @@ if [ ! -f "$BUILDDIR/lk2nd/build-lk1st-msm8916/emmc_appsboot.mbn" ]; then
 
     make clean || true
 
+    make_args=(
+        "TOOLCHAIN_PREFIX=$ARM_CROSS"
+        "lk1st-msm8916"
+    )
+
+    if [ -n "$LK2ND_COMPATIBLE" ]; then
+        make_args=("LK2ND_COMPATIBLE=$LK2ND_COMPATIBLE" "${make_args[@]}")
+    fi
+
     make \
-        LK2ND_BUNDLE_DTB="msm8916-512mb-mtp.dtb" \
-        LK2ND_COMPATIBLE="yiming,uz801-v3" \
-        TOOLCHAIN_PREFIX="$ARM_CROSS" \
-        lk1st-msm8916
+        "LK2ND_BUNDLE_DTB=$LK2ND_BUNDLE_DTB" \
+        "${make_args[@]}"
 
 )
 

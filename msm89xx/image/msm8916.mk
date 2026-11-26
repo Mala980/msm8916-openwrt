@@ -16,6 +16,8 @@ endef
 define Build/generate-firmware
 	chmod +x $(TOPDIR)/target/linux/$(BOARD)/image/generate_firmware.sh
 	TOPDIR="$(TOPDIR)" \
+	LK2ND_BUNDLE_DTB="$(LK2ND_BUNDLE_DTB)" \
+	LK2ND_COMPATIBLE="$(LK2ND_COMPATIBLE)" \
 	$(TOPDIR)/target/linux/$(BOARD)/image/generate_firmware.sh $@
 endef
 
@@ -30,6 +32,11 @@ define Device/msm8916
 	ARTIFACT/squashfs-gpt_both0.bin := generate-squashfs-gpt
 	ARTIFACT/flash.sh := install-flasher
 	ARTIFACT/firmware.zip := generate-firmware
+	# lk2nd (migrate-mode first stage). The bundle DTB carries the device
+	# nodes; LK2ND_COMPATIBLE selects one of them. Empty means "let lk2nd
+	# match dynamically from the boot cmdline" instead of forcing a board.
+	LK2ND_BUNDLE_DTB := msm8916-512mb-mtp.dtb
+	LK2ND_COMPATIBLE :=
 endef
 
 define Device/yiming-uz801v3
@@ -37,6 +44,9 @@ define Device/yiming-uz801v3
 	DEVICE_VENDOR := YiMing
 	DEVICE_MODEL := uz801v3
 	SUPPORTED_DEVICES := yiming,uz801-v3
+	# lk2nd upstream has an exact yiming-uz801-v3 node (dtb-files
+	# msm8916-yiming-uz801v3); select it explicitly.
+	LK2ND_COMPATIBLE := yiming,uz801-v3
 	FILESYSTEMS := squashfs
 	DEVICE_PACKAGES := wpad-basic-wolfssl rmtfs uci-usb-gadget \
 		block-mount e2fsprogs resize2fs tune2fs f2fs-tools tar \
