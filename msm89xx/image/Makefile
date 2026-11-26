@@ -3,6 +3,9 @@
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/image.mk
 
+# Per-device lk2nd configuration used by Build/generate-firmware.
+DEVICE_VARS += LK2ND_BUNDLE_DTB LK2ND_COMPATIBLE
+
 
 define Build/Compile
 	$(CP) $(LINUX_DIR)/COPYING $(KDIR)/COPYING.linux
