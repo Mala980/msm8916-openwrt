@@ -154,6 +154,23 @@ Verify the device from the host with:
 fastboot devices
 ```
 
+#### Fastboot via the reset button
+
+If the device does not boot at all (or `reboot-bootloader` is unavailable), hold the
+**Restart/Reset** button while applying power (or while plugging in the USB cable) and
+keep holding it until the device enumerates:
+
+```bash
+fastboot devices
+```
+
+This works because the `firmware.zip` bundle ships an `lk2nd` that maps the board's
+reset button to `KEY_HOME` in its bundled device tree; `lk2nd` then stops in Fastboot
+mode instead of booting the kernel. The GPIO/polarity per board is documented in
+`msm89xx/lk2nd/0001-msm8916-mtp-add-gpio-keys-for-modem-sticks.patch` (UZ801: GPIO23,
+active low). Release the button after the device shows up — a normal power-on with the
+button untouched boots OpenWrt as usual.
+
 ### Android/ADB EDL
 
 Where ADB is available, the standard Android command can also be used:

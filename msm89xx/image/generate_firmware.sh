@@ -20,6 +20,15 @@ LK2ND_COMPATIBLE="${LK2ND_COMPATIBLE:-}"
 LK2ND_KEY="$(printf '%s' "${LK2ND_COMPATIBLE:-generic}-${LK2ND_BUNDLE_DTB%.dtb}" |
     tr -c 'A-Za-z0-9_.-' '_')"
 
+# Upstream revisions, pinned so that the bootloader in firmware.zip does not
+# change silently between builds. Bump these together with any lk2nd patch in
+# target/linux/msm89xx/lk2nd/.
+QHYPSSTUB_REV="fca3c513b6fb5e5b8fabae21dac1f4a5c0b51bc6"
+LK2ND_REV="bef71355c7e8742d21d6eaffc6a2d0065580cf07"
+QTESTSIGN_REV="0eef3b552b1ada848f22bad38ab2e40407307c5b"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
 ###############################################################################
 # Temporary working directory
 ###############################################################################
@@ -160,6 +169,45 @@ for repo in qhypstub:qhypstub lk2nd:lk2nd qtestsign:qtestsign; do
     rm -rf "$BUILD_DIR"
 
     cp -a "$CACHE_DIR" "$BUILD_DIR"
+
+    case "$name" in
+    qhypstub)  rev="$QHYPSSTUB_REV" ;;
+    lk2nd)     rev="$LK2ND_REV" ;;
+    qtestsign) rev="$QTESTSIGN_REV" ;;
+    esac
+
+    if [ -n "$rev" ]; then
+
+        if ! git -C "$BUILD_DIR" rev-parse --verify --quiet "$rev^{commit}" >/dev/null; then
+            echo "[+] Fetching $name for pinned revision $rev..."
+            git -C "$BUILD_DIR" fetch --quiet origin || true
+        fi
+
+        git -C "$BUILD_DIR" checkout --quiet "$rev"
+
+    fi
+
+done
+
+###############################################################################
+# lk2nd patches (device nodes, key mapping, ...)
+###############################################################################
+
+for p in "$SCRIPT_DIR"/../lk2nd/*.patch; do
+
+    [ -e "$p" ] || continue
+
+    echo "[+] Applying lk2nd patch: $(basename "$p")..."
+
+    (
+        cd "$BUILDDIR/lk2nd"
+
+        patch \
+            -p1 \
+            --batch \
+            --silent \
+            < "$p"
+    )
 
 done
 
