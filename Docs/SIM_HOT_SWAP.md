@@ -1,6 +1,8 @@
 # Physical SIM Hot-Swap
 
-**Status:** implemented and live-verified on **HMUF02-V5 only**.
+**Status:** implemented and live-verified on **HMUF02-V5**. The `sim_hotplug`
+node has since been added for **UZ801 v3** (patch 853) but is **not yet
+verified on hardware**.
 **Other boards:** **untested** — the hardware *may* expose a usable
 `sim_hotplug` line, but nobody has verified it yet. See
 [Testing on another board](#testing-on-another-board).
@@ -108,15 +110,15 @@ re-initialise UIM when data fails.
 | Board | `sim_hotplug` node in current DTS | Hot-swap |
 | :--- | :--- | :--- |
 | `hmuf02v5` (HMUF02-V5) | **yes** — patch 805, `&tlmm 114` | **implemented + verified** |
-| `uz801` | not in current patch | **untested — verify** |
+| `uz801` | **yes** — patch 853, `&tlmm 114` | **node added — untested** |
 | `ufi001b` | not in current patch | **untested — verify** |
 | `ufi003` | not in current patch | **untested — verify** |
 | `uf02` | not in current patch | **untested — verify** |
 | `mf800b` | not in current patch | **untested — verify** |
 
-Only patch **805** currently defines `/sim-presence/sim_hotplug`
-(`gpios = <&tlmm 114 GPIO_ACTIVE_HIGH>`). The service ships in the
-shared `base-files` and is `enabled 1` on every board.
+Patch **805** (HMUF02-V5) and patch **853** (UZ801 v3) define
+`/sim-presence/sim_hotplug` (`gpios = <&tlmm 114 GPIO_ACTIVE_HIGH>`). The
+service ships in the shared `base-files` and is `enabled 1` on every board.
 
 > **Node gate (not in release r6).** As shipped, `sim-hotplug` starts on
 > every board and only `pulse_sim` checks for the line. On a board with no

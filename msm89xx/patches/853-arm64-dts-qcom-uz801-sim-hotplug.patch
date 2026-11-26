@@ -1,0 +1,28 @@
+--- a/arch/arm64/boot/dts/qcom/msm8916-yiming-uz801v3.dts
++++ b/arch/arm64/boot/dts/qcom/msm8916-yiming-uz801v3.dts
+@@ -49,3 +49,25 @@
+ &bam_dmux {
+ 	qcom,a2-pin;
+ };
++
++/*
++ * SIM presence / hotplug control line (TLMM GPIO114).
++ *
++ * Stock Android on this board exposes the line as a gpio-leds node and
++ * toggles it at runtime to make the baseband re-read the SIM slot.  The
++ * modem firmware has hotswap disabled: it notices a removal on its own but
++ * never an insertion, so userspace has to pulse this line.  default-state
++ * "off" drives it LOW, which is the "SIM present" assertion.
++ */
++/ {
++	sim-presence {
++		compatible = "gpio-leds";
++
++		sim_hotplug {
++			gpios = <&tlmm 114 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++			linux,default-trigger = "none";
++			retain-state-suspended;
++		};
++	};
++};
