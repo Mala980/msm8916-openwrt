@@ -19,6 +19,11 @@ services:
 
     network_mode: host
 
+    environment:
+      # The builder runs as root (see `user` above), and GNU tar's configure
+      # aborts with "you should not run configure as root" without this.
+      FORCE_UNSAFE_CONFIGURE: "1"
+
     volumes:
       - ${OPENWRT_REPO_DIR:-..}:/repo
 

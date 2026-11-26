@@ -79,6 +79,13 @@ jobs:
         run: |
           ./build.sh build all
 
+      # The builder container runs as root, so everything it writes through the
+      # bind mount is root-owned. The packaging steps below run as the runner
+      # user and must be able to create files inside openwrt/bin.
+      - name: Fix build output ownership
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" openwrt/bin
+
       - name: Compile Extra Packages (CUPS Print Server & Drivers)
         run: |
           docker compose -f devenv/docker-compose.yml exec -T builder bash -c "
