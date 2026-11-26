@@ -387,7 +387,7 @@ These devices run hot in a small enclosure, and the modem's behaviour is sensiti
 
 * **CPU rail (mainline CPR)** — the CPU voltage is managed by mainline **CPR** (Core Power Reduction) rather than a fixed rail, matching Android's voltage for the silicon's fused speed bin. This lowers idle and mid-load CPU voltage versus a static setting.
 * **CPU OPP cap** — the top 998.4 MHz operating point is removed, so the CPUs run at up to **800 MHz** (matching Android's cap on these parts).
-* **Wi-Fi + PMIC thermal mitigation (HMUF02-V5)** — the `wcn36xx` driver exposes a cooling device that throttles the Wi-Fi transmit path, and the PMIC's thermal zone is bound to the CPU cooling device. Trips are triggered from the CPU cluster sensor, mirroring Android's `thermal-engine` "wlan" action.
+* **Wi-Fi + PMIC thermal mitigation (HMUF02-V5, UZ801 v3)** — the `wcn36xx` driver exposes a cooling device that throttles the Wi-Fi transmit path, and the PMIC's thermal zone is bound to the CPU cooling device. Trips are triggered from the CPU cluster sensor, mirroring Android's `thermal-engine` "wlan" action.
 
 ```bash
 # Inspect the thermal zones and their cooling devices

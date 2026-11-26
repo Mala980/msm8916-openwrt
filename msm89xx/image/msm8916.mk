@@ -40,7 +40,7 @@ define Device/yiming-uz801v3
 	FILESYSTEMS := squashfs
 	DEVICE_PACKAGES := wpad-basic-wolfssl rmtfs uci-usb-gadget \
 		block-mount e2fsprogs resize2fs tune2fs f2fs-tools tar \
-		msm-firmware-dumper reboot-edl qcom-carrier-autocfg \
+		msm-firmware-dumper reboot-edl qcom-carrier-autocfg qcom-time-daemon \
 		diag-efs diag-logtool luci-theme-proton2025 libcurl curl \
 		htop iperf3 ttyd luci-app-ttyd ppp-mod-pptp kmod-pptp kmod-mppe \
 		sstp-client luci-proto-sstp openvpn-openssl kmod-tun
