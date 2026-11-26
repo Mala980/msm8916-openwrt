@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Hardware-free tests: no modem, no root, no OpenWrt. Each suite is a
       # tests/<name>/run.sh that exits non-zero on failure. --self-check also

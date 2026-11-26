@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -48,7 +48,7 @@ jobs:
           echo "Building for Tag: ${TAG}, OpenWrt Version: ${VERSION}"
 
       - name: Cache OpenWrt Downloads & Toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             openwrt/dl
@@ -145,3 +145,12 @@ jobs:
             openwrt/bin/targets/msm89xx/msm8916/*-msm89xx-msm8916-*-firmware.zip
             openwrt/bin/targets/msm89xx/msm8916/kmods-msm8916-${{ steps.vars.outputs.version }}.tar.gz
             openwrt/bin/targets/msm89xx/msm8916/sha256sums
+
+      # The builder container runs as root (user: 0:0), so files under the
+      # cached paths are root-owned. actions/cache's post-job runs as the
+      # runner and failed with tar exit 2 (Permission denied) on
+      # staging_dir/host/lib/meson/*. Hand ownership back before the job ends.
+      - name: Fix cache ownership
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" openwrt/dl openwrt/staging_dir 2>/dev/null || true

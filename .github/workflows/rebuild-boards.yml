@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -69,7 +69,7 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Cache OpenWrt Downloads & Toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             openwrt/dl
@@ -184,3 +184,12 @@ jobs:
           echo "Assets replaced in release \`${{ inputs.release_tag }}\`:" >> $GITHUB_STEP_SUMMARY
           while read -r n; do echo "- \`$n\`" >> $GITHUB_STEP_SUMMARY; done < /tmp/built-names.txt
           echo "- \`sha256sums\` (rebuilt-board lines refreshed)" >> $GITHUB_STEP_SUMMARY
+
+      # The builder container runs as root (user: 0:0), so files under the
+      # cached paths are root-owned. actions/cache's post-job runs as the
+      # runner and failed with tar exit 2 (Permission denied) on
+      # staging_dir/host/lib/meson/*. Hand ownership back before the job ends.
+      - name: Fix cache ownership
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" openwrt/dl openwrt/staging_dir 2>/dev/null || true
