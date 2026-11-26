@@ -77,8 +77,8 @@ if [ ! -f /etc/apk/keys/akbar-npj-v25.12.5.pem ]; then
     mkdir -p /etc/apk/keys
     cat << 'EOF' > /etc/apk/keys/akbar-npj-v25.12.5.pem
 -----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVuQP6A+xWmNj1/rPFN+9adeTnVrG
-oxFMGAsoNcx1eInT4k6nu3H8Azjzaluvuk1VPQ11tE+XaIgDBEI8rms84A==
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAETklKjN1HhZMhw4URngXGEauVRfhW
+17WzKajTLZsIX00xiAF2yYfckkfIGHiySBsk+8mSHsOCFCg5i6Ngh4Zt8w==
 -----END PUBLIC KEY-----
 EOF
 fi
